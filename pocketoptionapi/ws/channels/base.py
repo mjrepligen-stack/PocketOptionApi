@@ -1,8 +1,8 @@
-"""Module for base Pocket Option base websocket chanel."""
+"""Module for base Pocket Option base websocket channel."""
 
 
 class Base(object):
-    """Class for base Pocket Option websocket chanel."""
+    """Class for base Pocket Option websocket channel."""
 
     # pylint: disable=too-few-public-methods
 

@@ -3,23 +3,13 @@ import time
 from datetime import datetime, timedelta, timezone
 
 
+logger = logging.getLogger(__name__)
+
 class TimeSynchronizer:
     def __init__(self):
         self.server_time_reference = None
         self.local_time_reference = None
-        self.timezone_offset = timedelta(seconds=self._get_local_timezone_offset())
-
-    @staticmethod
-    def _get_local_timezone_offset():
-        """
-        Obtiene el desplazamiento de la zona horaria local en segundos.
-
-        :return: Desplazamiento de la zona horaria local en segundos.
-        """
-        local_time = datetime.now()
-        utc_time = datetime.utcnow()
-        offset = (local_time - utc_time).total_seconds()
-        return offset
+        self.offset = None
 
     def synchronize(self, server_time):
         """
@@ -27,9 +17,11 @@ class TimeSynchronizer:
 
         :param server_time: Tiempo del servidor en segundos (puede ser un timestamp).
         """
-
         self.server_time_reference = server_time
         self.local_time_reference = time.time()
+        self.offset = self.local_time_reference - self.server_time_reference
+        logger.debug("synchronize > Tiempo sincronizado con el servidor")
+
 
     def get_synced_time(self):
         """
@@ -43,23 +35,21 @@ class TimeSynchronizer:
         # Calcula la diferencia de tiempo desde la última sincronización
         elapsed_time = time.time() - self.local_time_reference
         # Calcula el tiempo sincronizado
-        synced_time = self.server_time_reference + elapsed_time
+        synced_time = self.server_time_reference + elapsed_time + self.offset
         return synced_time
 
     def get_synced_datetime(self):
         """
-        Convierte el tiempo sincronizado a un objeto datetime ajustado a la zona horaria local.
+        Convierte el tiempo sincronizado a un objeto datetime en la zona horaria local.
 
         :return: Tiempo sincronizado como un objeto datetime.
         """
-        synced_time_seconds = self.get_synced_time()
-        # Redondear los segundos
-        rounded_time_seconds = round(synced_time_seconds)
+        synced_time_seconds = int(self.get_synced_time())
         # Convertir a datetime en UTC
-        synced_datetime_utc = datetime.fromtimestamp(rounded_time_seconds, tz=timezone.utc)
-        # Ajustar el tiempo sincronizado a la zona horaria local
-        synced_datetime_local = synced_datetime_utc + self.timezone_offset
-        return synced_datetime_local
+        synced_datetime = datetime.fromtimestamp(synced_time_seconds, tz=timezone.utc)
+        local_datetime = synced_datetime.astimezone()
+        # No necesitamos ajustar la zona horaria ya que el servidor usa UTC
+        return local_datetime
 
     def update_sync(self, new_server_time):
         """

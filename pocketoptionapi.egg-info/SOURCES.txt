@@ -1,7 +1,0 @@
-setup.py
-pocketoptionapi.egg-info/PKG-INFO
-pocketoptionapi.egg-info/SOURCES.txt
-pocketoptionapi.egg-info/dependency_links.txt
-pocketoptionapi.egg-info/not-zip-safe
-pocketoptionapi.egg-info/requires.txt
-pocketoptionapi.egg-info/top_level.txt

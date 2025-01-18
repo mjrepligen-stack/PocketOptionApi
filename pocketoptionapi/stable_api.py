@@ -21,12 +21,13 @@ import pandas as pd
 from pocketoptionapi.api import PocketOptionAPI
 import pocketoptionapi.constants as OP_code
 import pocketoptionapi.global_value as global_value
+import json
 
-# Configuración del logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# # Configuración del logging
+# logging.basicConfig(
+#     level=logging.INFO,
+#     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+# )
 logger = logging.getLogger(__name__)
 
 # Obtener la zona horaria local del sistema
@@ -52,7 +53,7 @@ class PocketOption:
     """
     
     __version__ = "1.0.0"
-    
+
     def __init__(self, ssid: str):
         """
         Inicializa el cliente de PocketOption.
@@ -85,6 +86,10 @@ class PocketOption:
         self.api = PocketOptionAPI()
         self.loop = asyncio.get_event_loop()
         
+        # Inicializar DataFeed
+        from pocketoptionapi.datafeed import DataFeed
+        self.datafeed = DataFeed(self.api)
+
         # Estado de suscripciones
         self.subscribe_candle: List = []
         self.subscribe_candle_all_size: List = []
@@ -98,7 +103,12 @@ class PocketOption:
         
         # Datos de trading
         self._init_trading_data()
-    
+        
+        self._stream_thread = None
+        self._stream_active = False
+
+        self._history_data_event = threading.Event()
+
     def _init_trading_data(self):
         """Inicializa las estructuras de datos para trading."""
         self.get_digital_spot_profit_after_sale_data = nested_dict(2, int)
@@ -114,7 +124,7 @@ class PocketOption:
         Returns:
             int: Timestamp del servidor en segundos
         """
-        return self.api.time_sync.server_timestamp
+        return self.api.time_sync.get_synced_time()
 
     def get_server_datetime(self) -> datetime:
         """
@@ -123,7 +133,7 @@ class PocketOption:
         Returns:
             datetime: Fecha y hora del servidor
         """
-        return self.api.time_sync.server_datetime
+        return self.api.time_sync.get_synced_datetime()
 
     def set_session(self, header: Dict[str, str], cookie: Dict[str, str]) -> None:
         """
@@ -300,9 +310,10 @@ class PocketOption:
                 self.api.order_async["deals"] and 
                 self.api.order_async["deals"][0]["id"] == buy_order_id):
                 return self.api.order_async["deals"][0]
+            return None
         except Exception as e:
             logger.debug(f"Error obteniendo orden asíncrona: {str(e)}")
-        return None
+            return None
 
     def get_async_order_id(self, buy_order_id):
         return self.api.order_async["deals"][0][buy_order_id]
@@ -313,54 +324,48 @@ class PocketOption:
     def buy(self, amount: float, active: str, action: str, expirations: int) -> Tuple[bool, Optional[str]]:
         """
         Realiza una operación de compra.
-        
-        Args:
-            amount: Cantidad a invertir
-            active: Activo a operar
-            action: Tipo de operación ('call' o 'put')
-            expirations: Tiempo de expiración en segundos
-            
-        Returns:
-            Tuple[bool, Optional[str]]: (éxito de la operación, ID de la orden si es exitosa)
         """
         try:
+            logger.debug(f"Iniciando compra: {action} {amount} en {active}")
             # Reiniciar variables de estado
             self.api.buy_multi_option = {}
             self.api.buy_successful = None
             req_id = "buy"
-            
+
             # Inicializar estructura de datos para la orden
             if req_id not in self.api.buy_multi_option:
                 self.api.buy_multi_option[req_id] = {"id": None}
             else:
                 self.api.buy_multi_option[req_id]["id"] = None
-            
+
             # Reiniciar datos globales
             global_value.order_data = None
             global_value.result = None
-            
+
             # Enviar orden de compra
+            logger.debug("Enviando orden al servidor...")
             self.api.buyv3(amount, active, action, expirations, req_id)
-            
+
             # Esperar respuesta con timeout
             start_time = time.time()
             timeout = 5  # segundos
             
             while time.time() - start_time < timeout:
                 if global_value.result is not None and global_value.order_data is not None:
+                    logger.debug(f"Orden completada: {global_value.order_data}")
                     return global_value.result, global_value.order_data.get("id")
                 time.sleep(0.1)
             
-            # Verificar si hubo error
-            if isinstance(global_value.order_data, dict) and "error" in global_value.order_data:
-                logger.error(f"Error en la orden: {global_value.order_data['error']}")
-                return False, None
+                # Verificar si hubo error
+                if isinstance(global_value.order_data, dict) and "error" in global_value.order_data:
+                    logger.error(f"Error en la orden: {global_value.order_data['error']}")
+                    return False, None
             
             logger.error("Timeout esperando respuesta de la orden")
             return False, None
             
         except Exception as e:
-            logger.error(f"Error ejecutando orden: {str(e)}")
+            logger.error(f"Error ejecutando orden: {str(e)}", exc_info=True)
             return False, None
 
     def _check_win_worker(self):
@@ -633,7 +638,32 @@ class PocketOption:
             if not tick_data:
                 raise ValueError("Datos de ticks vacíos")
             
-            return self._process_tick_list(tick_data)
+            # Convertir lista de diccionarios a DataFrame
+            df = pd.DataFrame(tick_data)
+            
+            # Asegurar que tenemos las columnas necesarias
+            if 'time' not in df.columns or 'price' not in df.columns:
+                logger.error("Formato de datos inválido para ticks")
+                return pd.DataFrame()
+            
+            # Convertir tiempo a timestamp entero
+            df['time'] = df['time'].astype(float).astype(int)
+            
+            # Ordenar por tiempo
+            df.sort_values('time', inplace=True)
+            
+            # Crear DataFrame OHLC
+            ohlc = df.groupby(df['time']).agg({
+                'price': ['first', 'max', 'min', 'last']
+            }).reset_index()
+            
+            # Renombrar columnas
+            ohlc.columns = ['time', 'open', 'high', 'low', 'close']
+            
+            # Convertir timestamps a datetime local
+            ohlc = self._convert_to_local_datetime(ohlc)
+            
+            return ohlc
             
         except Exception as e:
             logger.error(f"Error procesando ticks: {str(e)}")
@@ -642,21 +672,6 @@ class PocketOption:
     def _process_ohlc_data(self, data: dict) -> pd.DataFrame:
         """
         Procesa datos OHLC (períodos >= 60 segundos).
-        El formato esperado es:
-        {
-            "data": [
-                {
-                    "time": timestamp,
-                    "open": value,
-                    "high": value,
-                    "low": value,
-                    "close": value,
-                    "symbol_id": id,
-                    "asset": "symbol"
-                },
-                ...
-            ]
-        }
         """
         try:
             # Obtener los datos, ya sea de data o directamente
@@ -670,12 +685,16 @@ class PocketOption:
             # Verificar columnas requeridas
             required_columns = ['time', 'open', 'high', 'low', 'close']
             missing_columns = [col for col in required_columns if col not in df.columns]
-            if missing_columns:
-                raise ValueError(f"Faltan columnas requeridas: {missing_columns}")
             
-            # Eliminar columnas innecesarias
-            columns_to_keep = required_columns.copy()
-            df = df[columns_to_keep]
+            if missing_columns:
+                # Si faltan columnas, intentar construir desde price
+                if 'price' in df.columns:
+                    df = df.rename(columns={'price': 'close'})
+                    df['open'] = df['close']
+                    df['high'] = df['close']
+                    df['low'] = df['close']
+                else:
+                    raise ValueError(f"Faltan columnas requeridas: {missing_columns}")
             
             # Convertir tiempo a timestamp entero
             df['time'] = df['time'].astype(float).astype(int)
@@ -698,43 +717,64 @@ class PocketOption:
         active: str, 
         period: int, 
         start_time: Optional[int] = None,
-        count: Optional[int] = None,
+        offset: Optional[int] = None,
         count_request: int = 1,
     ) -> Optional[pd.DataFrame]:
         """
-        Obtiene datos históricos de velas completos.
-        
-        Args:
-            active: Activo para obtener datos
-            period: Período de las velas en segundos
-            start_time: Timestamp inicial (None para usar tiempo actual)
-            count: Número de velas por petición (None para usar el máximo según el período)
-            count_request: Número de peticiones a realizar
-            
-        Returns:
-            Optional[pd.DataFrame]: DataFrame con los datos de las velas o None si hay error
+        Obtiene datos históricos de velas completos, combinando datos históricos con tiempo real.
         """
         try:
-            self.api.history_data = None
+            logger.debug("Iniciando get_candles_full")
+            # Obtener datos históricos del servidor
+            historical_df = self._get_historical_candles(active, period, start_time, offset, count_request)
+            logger.debug(f"Datos históricos obtenidos: {historical_df is not None}")
             
-            # Ajustar el count según el período
-            if count is None:
-                count = 2000 if period < 60 else 9000
+            # Combinar con datos en tiempo real del DataFeed
+            if historical_df is not None:
+                logger.debug("Combinando con datos en tiempo real")
+                result = self.datafeed.merge_with_historical(active, period, historical_df)
+                logger.debug(f"Combinación completada: {result is not None}")
+                return result
+            
+            # Si no hay datos históricos, intentar usar solo datos en tiempo real
+            logger.debug("Intentando obtener solo datos en tiempo real")
+            return self.datafeed.get_data(active, period, start_time)
+            
+        except Exception as e:
+            logger.error(f"Error obteniendo velas: {str(e)}", exc_info=True)
+            return None
+
+    def _get_historical_candles(
+        self, 
+        active: str, 
+        period: int, 
+        start_time: Optional[int] = None,
+        offset: Optional[int] = None,
+        count_request: int = 1,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Obtiene datos históricos del servidor.
+        """
+        all_data = []
+        
+        try:
+            # Ajustar el offset según el período
+            if offset is None:
+                offset = 2000 if period < 60 else 9000
             else:
                 # Asegurar que no exceda el límite
-                count = min(count, 2000 if period < 60 else 9000)
+                offset = min(offset, 2000 if period < 60 else 9000)
             
-            logger.debug(f"Usando count={count} para período de {period} segundos")
+            logger.debug(f"Usando offset={offset} para período de {period} segundos")
             
             # Determinar tiempo inicial
             if start_time is None:
-                time_sync = self.sync_timestamp()
-                # Redondear al período más cercano
-                time_start = (time_sync // period) * period
+                current_time = self.api.sync.get_synced_time()
+                time_start = (current_time // period) * period if period >= 60 else current_time
             else:
-                time_start = start_time
+                time_start = int(start_time)
             
-            all_data = []
+            current_time = time_start
             
             # Realizar peticiones de datos históricos
             for i in range(count_request):
@@ -743,26 +783,35 @@ class PocketOption:
                     return None
                 
                 try:
+                    # Limpiar datos anteriores y evento
+                    self.api.history_data = None
+                    self._history_data_event.clear()
+                    
                     # Enviar petición de velas
-                    self.api.getcandles(active, period, count, time_start)
+                    self.api.getcandles(active, period, offset, int(current_time))
                     
-                    # Esperar respuesta
-                    wait_start = time.time()
-                    while self.check_connect() and self.api.history_data is None:
-                        if time.time() - wait_start > 10:  # timeout 10 segundos
-                            break
-                        time.sleep(0.1)
-                    
-                    if self.api.history_data:
-                        processed_data = self.process_candles_data(self.api.history_data, period)
-                        if processed_data is not None:
-                            all_data.append(processed_data)
-                            logger.debug(f"Obtenidos {len(processed_data)} registros en petición {i+1}")
-                        self.api.history_data = None
-                        time_start -= count * period
+                    # Esperar respuesta usando Event
+                    if self._history_data_event.wait(timeout=10):
+                        if self.api.history_data:
+                            # Procesar datos según el período
+                            if period < 60:
+                                processed_data = self._process_tick_data({"data": self.api.history_data})
+                            else:
+                                processed_data = self._process_ohlc_data({"data": self.api.history_data})
+                            
+                            if processed_data is not None and not processed_data.empty:
+                                all_data.append(processed_data)
+                                logger.debug(f"Obtenidos {len(processed_data)} registros en petición {i+1}")
+                                
+                                # Actualizar el tiempo para la siguiente petición
+                                if i < count_request - 1:
+                                    oldest_time = int(processed_data['timestamp'].min())
+                                    current_time = oldest_time - period
+                            else:
+                                logger.warning("No se obtuvieron datos de velas en esta iteración")
                     else:
-                        logger.warning("No se obtuvieron datos de velas en esta iteración")
-                        
+                        logger.error("Timeout esperando datos históricos")
+                    
                 except Exception as e:
                     logger.error(f"Error obteniendo velas: {str(e)}")
                     continue
@@ -773,15 +822,19 @@ class PocketOption:
             
             # Combinar todos los datos
             final_df = pd.concat(all_data, ignore_index=True)
-            final_df.sort_values('time', inplace=True)
-            final_df.drop_duplicates(subset=['time'], keep='first', inplace=True)
+            
+            # Ordenar y eliminar duplicados
+            final_df.sort_values('time', ascending=True, inplace=True)
+            final_df.drop_duplicates(subset=['time'], keep='last', inplace=True)
             final_df.reset_index(drop=True, inplace=True)
             
             logger.debug(f"Total de registros procesados: {len(final_df)}")
+            logger.debug(f"Rango de tiempo: {final_df['time'].min()} a {final_df['time'].max()}")
+            
             return final_df
             
         except Exception as e:
-            logger.error(f"Error procesando datos de velas: {str(e)}")
+            logger.error(f"Error procesando datos de velas: {str(e)}", exc_info=True)
             return None
 
     def process_30_second_data(self, df: pd.DataFrame, period: int) -> pd.DataFrame:
@@ -799,7 +852,7 @@ class PocketOption:
             # Convertir tiempo a segundos y redondear
             df['time'] = df['time'].astype(float)
             df['time_30s'] = ((df['time'] // period) * period).astype(int)
-            
+
             # Crear rango completo de tiempo
             start_time = df['time_30s'].min()
             end_time = df['time_30s'].max()
@@ -807,18 +860,18 @@ class PocketOption:
                 range(start_time, end_time + period, period),
                 name='time_30s'
             )
-            
+
             # Asegurar que todos los intervalos estén presentes
             df = df.merge(all_times, on='time_30s', how='right')
-            
+
             # Agrupar por intervalo y calcular OHLC
             grouped = df.groupby('time_30s').agg({
                 'price': ['first', 'last', 'max', 'min']
             }).reset_index()
-            
+
             # Renombrar columnas
             grouped.columns = ['time', 'open', 'close', 'high', 'low']
-            
+
             return grouped
             
         except Exception as e:
@@ -901,3 +954,160 @@ class PocketOption:
 
     def sync_timestamp(self):
         return self.api.synced_timestamp
+
+    def start_streaming(self, active: str, period: int = 60) -> Optional[str]:
+        """
+        Inicia el streaming de datos para un activo específico.
+        
+        Args:
+            active: Nombre del activo
+            period: Período en segundos (default: 60)
+            
+        Returns:
+            Optional[str]: ID del stream si se inició correctamente, None si hubo error
+        """
+        try:
+            # Verificar conexión
+            if not self.check_connect():
+                logger.error("No hay conexión al servidor")
+                return None
+            
+            # Establecer el activo actual
+            self.api.current_asset = active
+            logger.debug(f"Activo actual establecido: {active}")
+            
+            # Registrar el stream en el DataFeed antes de cambiar el símbolo
+            stream_id = self.api.datafeed.register_stream(active, period)
+            
+            # Enviar mensaje de cambio de símbolo
+            self.api.change_symbol(active, period)
+            logger.info(f"Iniciado streaming para {active} período {period}")
+            
+            # Esperar a que lleguen los primeros datos
+            wait_start = time.time()
+            stream_key = f"stream_{active}"
+            
+            while time.time() - wait_start < 5:  # Esperar máximo 5 segundos
+                if hasattr(self.api, stream_key):
+                    logger.info(f"Stream registrado con ID: {stream_id}")
+                    return stream_id
+                time.sleep(0.1)
+            
+            logger.warning("No se recibieron datos iniciales del stream")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error iniciando streaming: {str(e)}")
+            return None
+
+    def stop_streaming(self, stream_id: str) -> bool:
+        """
+        Detiene un stream específico.
+        
+        Args:
+            stream_id: ID del stream a detener
+            
+        Returns:
+            bool: True si se detuvo correctamente
+        """
+        try:
+            # Desactivar el stream en el DataFeed
+            if self.api.datafeed.deactivate_stream(stream_id):
+                stream_info = self.api.datafeed._active_streams[stream_id]
+                logger.info(f"Stream {stream_id} detenido para {stream_info['asset']}")
+                return True
+            return False
+            
+        except Exception as e:
+            logger.error(f"Error deteniendo stream: {str(e)}")
+            return False
+
+    def get_stream_data(self, stream_id: str, limit: int = None) -> Optional[List[dict]]:
+        """
+        Obtiene los datos del stream.
+        
+        Args:
+            stream_id: ID del stream
+            limit: Número máximo de ticks a retornar
+            
+        Returns:
+            Optional[List[dict]]: Lista de ticks o None si hay error
+        """
+        try:
+            return self.api.datafeed.get_stream_data(stream_id, limit)
+        except Exception as e:
+            logger.error(f"Error obteniendo datos del stream: {str(e)}")
+            return None
+
+    def get_current_price(self) -> Optional[float]:
+        """
+        Obtiene el precio actual del stream.
+        
+        Returns:
+            Optional[float]: Precio actual o None si no hay stream activo
+        """
+        return self.current_price if hasattr(self, 'current_price') else None
+
+    def get_current_timestamp(self) -> Optional[float]:
+        """
+        Obtiene el timestamp actual del stream.
+        
+        Returns:
+            Optional[float]: Timestamp actual o None si no hay stream activo
+        """
+        return self.current_timestamp if hasattr(self, 'current_timestamp') else None
+
+    def process_history_new(self, active: str, period: int) -> None:
+        """
+        Procesa los datos de historyNew y los envía al DataFeed.
+        """
+        if self.api.historyNew:
+            self.datafeed.update_from_history_new(active, period, self.api.historyNew)
+            logger.info(f"Datos de historyNew procesados para {active}")
+        else:
+            logger.warning("No hay datos de historyNew disponibles")
+
+    def get_ticks_data(self, active: str) -> pd.DataFrame:
+        """
+        Obtiene los datos de ticks almacenados en el DataFeed.
+        
+        Args:
+            active: Nombre del activo
+            
+        Returns:
+            DataFrame con los datos de ticks
+        """
+        return self.api.datafeed.get_ticks_data(active)
+
+    def get_candles(self, active: str, period: int, count: int = 500) -> Optional[pd.DataFrame]:
+        """
+        Obtiene los datos de velas para un activo y período específicos.
+        
+        Args:
+            active (str): El símbolo del activo
+            period (int): Período de las velas en segundos
+            count (int): Número de velas a obtener
+            
+        Returns:
+            Optional[pd.DataFrame]: DataFrame con los datos de las velas o None si hay error
+        """
+        try:
+            return self.get_candles_full(active, period, offset=count)
+        except Exception as e:
+            logger.error(f"Error obteniendo velas: {e}")
+            return None
+
+    def is_time_synced(self) -> bool:
+        """
+        Verifica si el tiempo está sincronizado con el servidor.
+        
+        Returns:
+            bool: True si el tiempo está sincronizado, False si no
+        """
+        try:
+            return (self.api.time_sync.server_time_reference is not None and 
+                   self.api.time_sync.local_time_reference is not None and 
+                   self.api.time_sync.offset is not None)
+        except Exception as e:
+            logger.error(f"Error verificando sincronización de tiempo: {e}")
+            return False

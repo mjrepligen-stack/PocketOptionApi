@@ -11,6 +11,7 @@ import atexit
 from collections import deque
 from pocketoptionapi.ws.client import WebsocketClient
 from pocketoptionapi.ws.channels.get_balances import *
+from typing import List, Optional, Dict, Any
 
 from pocketoptionapi.ws.channels.ssid import Ssid
 # from pocketoptionapi.ws.channels.subscribe import *
@@ -45,7 +46,7 @@ from pocketoptionapi.ws.channels.buyv3 import *
 # from pocketoptionapi.ws.channels.change_tpsl import Change_Tpsl
 # from pocketoptionapi.ws.channels.change_auto_margin_call import ChangeAutoMarginCall
 
-from pocketoptionapi.ws.objects.timesync import TimeSync
+from pocketoptionapi.ws.objects.time_sync import TimeSynchronizer
 # from pocketoptionapi.ws.objects.profile import Profile
 from pocketoptionapi.ws.objects.candles import Candles
 # from pocketoptionapi.ws.objects.listinfodata import ListInfoData
@@ -53,14 +54,11 @@ from pocketoptionapi.ws.objects.candles import Candles
 import pocketoptionapi.global_value as global_value
 from pocketoptionapi.ws.channels.change_symbol import ChangeSymbol
 from collections import defaultdict
-from pocketoptionapi.ws.objects.time_sync import TimeSynchronizer
+from pocketoptionapi.datafeed import DataFeed
+
+logger = logging.getLogger(__name__)
 
 
-def nested_dict(n, type):
-    if n == 1:
-        return defaultdict(type)
-    else:
-        return defaultdict(lambda: nested_dict(n - 1, type))
 
 
 # InsecureRequestWarning: Unverified HTTPS request is being made.
@@ -73,9 +71,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
 
     # pylint: disable=too-many-public-methods
     socket_option_opened = {}
-    time_sync = TimeSync()
-    sync = TimeSynchronizer()
-    timesync = None
+    time_sync = TimeSynchronizer()
     # pylint: disable=too-many-arguments
     # profile = Profile()
     candles = Candles()
@@ -85,13 +81,8 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
     # for digital
     underlying_list_data = None
     position_changed = None
-    instrument_quites_generated_data = nested_dict(2, dict)
-    instrument_quotes_generated_raw_data = nested_dict(2, dict)
-    instrument_quites_generated_timestamp = nested_dict(2, dict)
     strike_list = None
     leaderboard_deals_client = None
-    # position_changed_data = nested_dict(2, dict)
-    # microserviceName_binary_options_name_option=nested_dict(2,dict)
     order_async = None
     # game_betinfo = Game_betinfo_data()
     instruments = None
@@ -111,13 +102,6 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
     overnight_fee = None
     # ---for real time
     digital_option_placed_id = None
-    live_deal_data = nested_dict(3, deque)
-
-    subscribe_commission_changed_data = nested_dict(2, dict)
-    real_time_candles = nested_dict(3, dict)
-    real_time_candles_maxdict_table = nested_dict(2, dict)
-    candle_generated_check = nested_dict(2, dict)
-    candle_generated_all_size_check = nested_dict(1, dict)
     # ---for api_game_getoptions_result
     api_game_getoptions_result = None
     sold_options_respond = None
@@ -139,6 +123,8 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
     historyNew = None
     server_timestamp = None
     sync_datetime = None
+ 
+    
 
     # ------------------
 
@@ -148,7 +134,6 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         """
         self.websocket_client = None
         self.websocket_thread = None
-        # self.wss_url = "wss://api-us-north.po.market/socket.io/?EIO=4&transport=websocket"
         self.session = requests.Session()
         self.session.verify = False
         self.session.trust_env = False
@@ -160,6 +145,8 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         self.buy_successful = None
         self.loop = asyncio.get_event_loop()
         self.websocket_client = WebsocketClient(self)
+        # Inicializar DataFeed
+        self.datafeed = DataFeed(self)
 
     @property
     def websocket(self):
@@ -178,7 +165,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         :param dict msg: The websocket request msg.
         """
 
-        logger = logging.getLogger(__name__)
+        
 
         # data = json.dumps(dict(name=name, msg=msg, request_id=request_id))
         data = f'42{json.dumps(msg)}'
@@ -193,7 +180,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         # Ejecutar la corutina connect dentro del bucle de eventos del nuevo hilo
         loop.run_until_complete(self.websocket.send_message(data))
 
-        logger.debug(data)
+        logger.debug(f"send_websocket_request: name: {name}, msg: {msg}, request_id: {request_id}")
         global_value.ssl_Mutual_exclusion_write = False
 
     def start_websocket(self):
@@ -286,13 +273,13 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
     def synced_datetime(self):
         try:
             if self.time_sync is not None:
-                self.sync.synchronize(self.time_sync.server_timestamp)
-                self.sync_datetime = self.sync.get_synced_datetime()
+                self.time_sync.synchronize(self.time_sync.server_timestamp)
+                self.sync_datetime = self.time_sync.get_synced_datetime()
             else:
-                logging.warning("timesync no está establecido")
+                logger.warning("timesync no está establecido")
                 self.sync_datetime = None
         except Exception as e:
-            logging.error(e)
+            logger.error(e)
             self.sync_datetime = None
 
         return self.sync_datetime
@@ -300,3 +287,58 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
     @property
     def synced_timestamp(self):
         return self.sync.get_synced_time()
+
+    async def process_stream_update(self, stream_data: dict) -> None:
+        """
+        Procesa las actualizaciones del stream en tiempo real y las envía al DataFeed.
+        
+        Args:
+            stream_data: Diccionario con los datos del stream
+                {
+                    "asset": str,
+                    "timestamp": float,
+                    "price": float
+                }
+        """
+        try:
+            # Verificar que tenemos todos los datos necesarios
+            if not all(key in stream_data for key in ["asset", "timestamp", "price"]):
+                logger.warning("Datos de stream incompletos")
+                return
+
+            # Enviar datos al DataFeed
+            await self.datafeed.update_stream(
+                asset=stream_data["asset"],
+                timestamp=stream_data["timestamp"],
+                price=stream_data["price"]
+            )
+            logger.debug(f"process_stream_update > Stream update: {stream_data}")
+            
+        except Exception as e:
+            logger.error(f"Error procesando stream update: {e}")
+
+    async def process_historical_ticks(self, historical_ticks: List[dict]) -> None:
+        """
+        Procesa un lote de ticks históricos y los envía al DataFeed.
+        
+        Args:
+            historical_ticks: Lista de diccionarios con los datos de los ticks
+                [{
+                    "asset": str,
+                    "timestamp": float,
+                    "price": float
+                }, ...]
+        """
+        try:
+            if not historical_ticks:
+                return
+                
+            # Ordenar ticks por timestamp
+            sorted_ticks = sorted(historical_ticks, key=lambda x: x["timestamp"])
+            
+            # Enviar todos los ticks al DataFeed
+            await self.datafeed.update_historical_ticks(sorted_ticks)
+            logger.debug(f"process_historical_ticks > Procesados {len(historical_ticks)} ticks históricos")
+            
+        except Exception as e:
+            logger.error(f"Error procesando ticks históricos: {e}")

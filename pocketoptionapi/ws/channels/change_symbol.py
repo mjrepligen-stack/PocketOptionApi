@@ -9,7 +9,7 @@ class ChangeSymbol(Base):
     """Class for Pocket option change symbol websocket chanel."""
     # pylint: disable=too-few-public-methods
 
-    name = "sendMessage"
+    name = "changeSymbol"
 
     def __call__(self, active_id, interval):
         """Method to send message to candles websocket chanel.
