@@ -143,7 +143,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         # If it is false, the last failed
         # If it is true, the last buy order was successful
         self.buy_successful = None
-        self.loop = asyncio.get_event_loop()
+        #self.loop = asyncio.get_event_loop()
         self.websocket_client = WebsocketClient(self)
         # Inicializar DataFeed
         self.datafeed = DataFeed(self)

@@ -28,6 +28,7 @@ class DataFeed:
         self._last_request_time = {}
         # Buffer para datos de stream en tiempo real
         self._stream_buffer = {}
+        self._candle_buffer = {}  # {stream_id: {"current_candle": dict, "completed_candles": deque}}
         self._stream_buffer_size = 1500  # Máximo número de ticks por activo
         # Control de streams activos
         self._active_streams = {}  # {stream_id: {"asset": asset, "period": period, "active": True}}
@@ -90,7 +91,7 @@ class DataFeed:
 
     async def update_stream(self, asset: str, timestamp: float, price: float) -> None:
         """
-        Actualiza el buffer de stream con nuevos datos.
+        Actualiza el buffer de stream con nuevos datos y procesa las velas.
         Solo actualiza si hay algún stream activo para ese activo.
         
         Args:
@@ -99,87 +100,95 @@ class DataFeed:
             price: Precio del tick
         """
         try:
-            # Verificar si hay algún stream activo para este activo
-            is_active = any(
-                stream["active"] and stream["asset"] == asset 
-                for stream in self._active_streams.values()
-            )
+            # Obtener streams activos para este activo
+            active_streams = [
+                (stream_id, stream_info) 
+                for stream_id, stream_info in self._active_streams.items()
+                if stream_info["active"] and stream_info["asset"] == asset
+            ]
             
-            if not is_active:
+            if not active_streams:
                 return
                 
-            # Crear entrada para el activo si no existe
-            if asset not in self._stream_buffer:
-                self._stream_buffer[asset] = deque(maxlen=self._stream_buffer_size)
-                logger.info(f"update_stream > Buffer histórico inicializado para {asset} con {self._stream_buffer_size} ticks")
-            
-            # Añadir nuevo tick
-            tick_data = {
-                "timestamp": timestamp,
-                "price": price
-            }
-            
-            # Insertar el tick en el buffer manteniendo el orden por timestamp
-            current_data = list(self._stream_buffer[asset])
-            
-            # Encontrar la posición correcta para insertar el nuevo tick
-            insert_pos = 0
-            for i, existing_tick in enumerate(current_data):
-                if existing_tick["timestamp"] > timestamp:
-                    insert_pos = i
-                    break
-                elif existing_tick["timestamp"] == timestamp:
-                    # Si ya existe un tick con el mismo timestamp, actualizamos su precio
-                    current_data[i] = tick_data
-                    self._stream_buffer[asset] = deque(current_data, maxlen=self._stream_buffer_size)
-                    return
+            # Procesar el tick para cada stream activo del asset
+            for stream_id, stream_info in active_streams:
+                period = stream_info["period"]
+                
+                # Inicializar buffer de velas si no existe
+                if stream_id not in self._candle_buffer:
+                    self._candle_buffer[stream_id] = {
+                        "current_candle": None,
+                        "completed_candles": deque(maxlen=self._stream_buffer_size)
+                    }
+                
+                candle_buffer = self._candle_buffer[stream_id]
+                current_candle = candle_buffer["current_candle"]
+                
+                # Calcular el inicio del período actual
+                current_period_start = (timestamp // period) * period
+                
+                # Si no hay vela actual, crear una nueva
+                if current_candle is None:
+                    candle_buffer["current_candle"] = self._init_candle(timestamp, price, period)
+                    logger.debug(f"Nueva vela iniciada para {asset} en período {period}s")
+                    continue
+                
+                # Si el tick pertenece a un nuevo período
+                if timestamp >= current_candle["timestamp"] + period:
+                    # Guardar la vela completada
+                    candle_buffer["completed_candles"].append(current_candle)
+                    logger.debug(f"Vela completada para {asset} en período {period}s")
+                    # Iniciar nueva vela
+                    candle_buffer["current_candle"] = self._init_candle(timestamp, price, period)
                 else:
-                    insert_pos = i + 1
+                    # Actualizar la vela actual
+                    candle_buffer["current_candle"] = self._update_candle(current_candle, timestamp, price)
             
-            # Insertar el tick en la posición correcta
-            current_data.insert(insert_pos, tick_data)
-            self._stream_buffer[asset] = deque(current_data, maxlen=self._stream_buffer_size)
-            
-            logger.debug(f"update_stream > Stream actualizado para {asset}: {tick_data}")
+            logger.debug(f"Tick procesado para {asset}: timestamp={timestamp}, price={price}")
             
         except Exception as e:
             logger.error(f"Error actualizando stream buffer: {e}")
+            logger.exception(e)
 
     def get_stream_data(self, stream_id: str, limit: int = None) -> List[dict]:
         """
-        Obtiene los datos más recientes del stream para un ID específico.
+        Obtiene las velas más recientes del stream para un ID específico.
         
         Args:
             stream_id: ID del stream
-            limit: Número máximo de ticks a retornar (None para todos)
+            limit: Número máximo de velas a retornar (None para todas)
             
         Returns:
-            Lista de ticks ordenados por timestamp
+            Lista de velas ordenadas por timestamp
         """
         try:
             if not self.is_stream_active(stream_id):
                 return []
                 
-            stream_info = self._active_streams[stream_id]
-            asset = stream_info["asset"]
-            
-            if asset not in self._stream_buffer:
+            if stream_id not in self._candle_buffer:
                 return []
             
-            # Obtener todos los datos del buffer
-            data = list(self._stream_buffer[asset])
+            # Obtener velas completadas y la vela actual
+            candle_buffer = self._candle_buffer[stream_id]
+            completed_candles = list(candle_buffer["completed_candles"])
+            current_candle = candle_buffer["current_candle"]
+            
+            # Añadir la vela actual si existe
+            if current_candle is not None:
+                completed_candles.append(current_candle)
             
             # Ordenar por timestamp
-            sorted_data = sorted(data, key=lambda x: x["timestamp"])
+            sorted_candles = sorted(completed_candles, key=lambda x: x["timestamp"])
             
             # Aplicar límite si se especifica
             if limit and limit > 0:
-                sorted_data = sorted_data[-limit:]
+                sorted_candles = sorted_candles[-limit:]
             
-            return sorted_data
+            return sorted_candles
             
         except Exception as e:
             logger.error(f"Error obteniendo datos del stream: {e}")
+            logger.exception(e)
             return []
 
     def get_data(self, active: str, period: int, start_time: Optional[int] = None) -> Optional[pd.DataFrame]:
@@ -353,3 +362,45 @@ class DataFeed:
                 
         except Exception as e:
             logger.error(f"Error actualizando buffer histórico: {e}") 
+
+    def _init_candle(self, timestamp: float, price: float, period: int) -> dict:
+        """
+        Inicializa una nueva vela con el primer tick.
+        
+        Args:
+            timestamp: Timestamp del tick
+            price: Precio del tick
+            period: Período en segundos
+            
+        Returns:
+            dict: Nueva vela inicializada
+        """
+        # Normalizar el timestamp al inicio del período
+        candle_start = (timestamp // period) * period
+        
+        return {
+            "timestamp": candle_start,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": 1
+        }
+
+    def _update_candle(self, candle: dict, timestamp: float, price: float) -> dict:
+        """
+        Actualiza una vela existente con un nuevo tick.
+        
+        Args:
+            candle: Vela actual
+            timestamp: Timestamp del nuevo tick
+            price: Precio del nuevo tick
+            
+        Returns:
+            dict: Vela actualizada
+        """
+        candle["high"] = max(candle["high"], price)
+        candle["low"] = min(candle["low"], price)
+        candle["close"] = price
+        candle["volume"] += 1
+        return candle 

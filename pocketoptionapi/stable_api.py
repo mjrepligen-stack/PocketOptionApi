@@ -84,7 +84,7 @@ class PocketOption:
         
         # Inicialización de API y componentes
         self.api = PocketOptionAPI()
-        self.loop = asyncio.get_event_loop()
+        #self.loop = asyncio.get_event_loop()
         
         # Inicializar DataFeed
         from pocketoptionapi.datafeed import DataFeed

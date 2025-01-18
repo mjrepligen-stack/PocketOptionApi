@@ -89,7 +89,7 @@ class WebsocketClient:
         
         self.region = REGION()
         self.url: Optional[str] = None
-        self.loop = asyncio.get_event_loop()
+        #self.loop = asyncio.get_event_loop()
         self.connected = global_value.websocket_is_connected
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
