@@ -540,6 +540,16 @@ class WebsocketClient:
                         logger.debug(f"updateStream > Stream update: {stream_data}")
                         return stream_data
                     
+            elif msg_type == "loadHistoryPeriod":
+                if isinstance(data, dict):
+                    self.api._history_data_event.set()
+                    self.api.history_data = data
+                    logger.debug(f"loadHistoryPeriod > Recibido: {data}")
+                    return data
+                else:
+                    logger.warning(f"loadHistoryPeriod > Datos no válidos: {data}")
+                    return None
+                    
             elif msg_type == "updateAssets":
                 if isinstance(data, list):
                     assets_info = []
@@ -569,43 +579,71 @@ class WebsocketClient:
                     logger.debug(f"Marcador de stream establecido: {stream_key}")
                     
                     if isinstance(data, dict) and "asset" in data:
-                        processed_data = {
+                        logger.info(f"updateHistoryNew > Recibidos datos para {data['asset']} con período {data.get('period')}")
+                        
+                        processed_candle = {
                             "asset": data["asset"],
                             "period": data.get("period"),
-                            "ticks": [],
                             "candles": []
                         }
                         
-                        # Procesar ticks del historial
-                        if "history" in data:
-                            logger.debug(f"updateHistoryNew > Procesando {len(data['history'])} ticks históricos")
-                            for tick in data["history"]:
-                                if isinstance(tick, list) and len(tick) >= 2:
-                                    processed_tick = {
-                                        "asset": data["asset"],
-                                        "timestamp": tick[0],
-                                        "price": tick[1]
-                                    }
-                                    await self.api.process_stream_update(processed_tick)
-
-                            logger.info(f"updateHistoryNew > Procesados {len(data['history'])} ticks históricos")
-                        
-                        # Procesar velas
+                        # Procesar velas primero
                         if "candles" in data:
                             logger.debug(f"updateHistoryNew > Procesando {len(data['candles'])} velas")
                             for candle in data["candles"]:
                                 if isinstance(candle, list) and len(candle) >= 5:
-                                    processed_candle = {
+                                    processed_candle["candles"].append({
                                         "timestamp": candle[0],
                                         "open": candle[1],
                                         "close": candle[2],
                                         "high": candle[3],
                                         "low": candle[4]
-                                    }
-                                    processed_data["candles"].append(processed_candle)
+                                    })
+                                    logger.debug(f"Vela procesada: timestamp={datetime.fromtimestamp(candle[0])} "
+                                               f"O={candle[1]} C={candle[2]} H={candle[3]} L={candle[4]}")
 
-                        logger.debug(f"updateHistoryNew > Historial procesado para {data['asset']}: {len(processed_data['ticks'])} ticks, {len(processed_data['candles'])} velas")
-                        return processed_data
+                            # Enviar las velas procesadas al datafeed
+                            if processed_candle["candles"]:
+                                # Verificar orden de timestamps
+                                timestamps = [c["timestamp"] for c in processed_candle["candles"]]
+                                is_ordered = all(timestamps[i] <= timestamps[i+1] for i in range(len(timestamps)-1))
+                                logger.info(f"Velas ordenadas por tiempo: {is_ordered}")
+                                
+                                await self.api.process_candle_update(
+                                    processed_candle["asset"],
+                                    processed_candle["period"],
+                                    processed_candle["candles"]
+                                )
+                                logger.info(f"updateHistoryNew > Enviadas {len(processed_candle['candles'])} velas al datafeed")
+                        
+                        # Luego procesar ticks del historial
+                        if "history" in data:
+                            logger.debug(f"updateHistoryNew > Procesando {len(data['history'])} ticks históricos")
+                            ticks_processed = 0
+                            last_timestamp = None
+                            
+                            for tick in data["history"]:
+                                if isinstance(tick, list) and len(tick) >= 2:
+                                    current_timestamp = tick[0]
+                                    if last_timestamp and current_timestamp < last_timestamp:
+                                        logger.warning(f"Tick fuera de orden: actual={current_timestamp} último={last_timestamp}")
+                                    
+                                    processed_tick = {
+                                        "asset": data["asset"],
+                                        "timestamp": current_timestamp,
+                                        "price": tick[1]
+                                    }
+                                    await self.api.process_stream_update(processed_tick)
+                                    ticks_processed += 1
+                                    last_timestamp = current_timestamp
+                                    
+                                    if ticks_processed % 100 == 0:
+                                        logger.debug(f"Procesados {ticks_processed} ticks")
+
+                            logger.info(f"updateHistoryNew > Procesados {ticks_processed} ticks históricos")
+
+                        logger.debug(f"updateHistoryNew > Historial procesado para {processed_candle['asset']}: {len(processed_candle['candles'])} velas")
+                        return processed_candle
                     else:
                         logger.warning(f"updateHistoryNew > Datos no válidos o sin asset: {data}")
                 except Exception as e:

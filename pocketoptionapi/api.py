@@ -148,6 +148,8 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         # Inicializar DataFeed
         self.datafeed = DataFeed(self)
 
+        self._history_data_event = threading.Event()
+
     @property
     def websocket(self):
         """Property to get websocket.
@@ -286,7 +288,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
 
     @property
     def synced_timestamp(self):
-        return self.sync.get_synced_time()
+        return self.time_sync.get_synced_time()
 
     async def process_stream_update(self, stream_data: dict) -> None:
         """
@@ -342,3 +344,28 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
             
         except Exception as e:
             logger.error(f"Error procesando ticks históricos: {e}")
+
+    async def process_candle_update(self, asset: str, period: int, candles: List[dict]) -> None:
+        """
+        Procesa las velas y las envía al datafeed.
+
+        Args:
+            asset: El símbolo del activo
+            period: El período de las velas en segundos
+            candles: Lista de velas procesadas
+        """
+        try:
+            # Verificar que el datafeed esté inicializado
+            if not hasattr(self, 'datafeed'):
+                logger.error("Datafeed no inicializado")
+                return
+
+            # Ordenar las velas por timestamp antes de enviarlas
+            sorted_candles = sorted(candles, key=lambda x: x['timestamp'])
+            
+            # Enviar al datafeed
+            self.datafeed.update_candles(asset, period, sorted_candles)
+            logger.debug(f"Velas procesadas para {asset}: {len(candles)}")
+            
+        except Exception as e:
+            logger.error(f"Error procesando velas: {e}")

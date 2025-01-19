@@ -16,8 +16,6 @@ def main():
         chart.precision(5)
 
         chart.candle_style(up_color='#32CD32', down_color='#FF0000')
-
-        chart.volume_config(up_color='#32CD32', down_color='#FF0000')
         
         # Conectar API
         ssid = r"""42["auth",{"session":"YOUR_SESSION","isDemo":1,"uid":0,"platform":2}]"""
@@ -30,7 +28,7 @@ def main():
             
         # Configuración
         asset = "AUDCAD_otc"
-        period = 60
+        period = 10
         
         # Iniciar streaming
         stream_id = api.start_streaming(asset, period)
@@ -41,7 +39,7 @@ def main():
             
         while True:
             try:
-                data = api.get_stream_data(stream_id, limit=20)
+                data = api.get_stream_data(stream_id, limit=100)
                 if data and len(data) > 0:
                     # Crear DataFrame
                     data_df = pd.DataFrame(data)
@@ -49,22 +47,22 @@ def main():
                     data_df.drop(columns=['timestamp'], inplace=True)
                     
                     # Reordenar columna
-                    data_df = data_df[['date', 'open', 'high', 'low', 'close', 'volume']]
+                    data_df = data_df[['date', 'open', 'high', 'low', 'close']]
                     
                     print("\nÚltimas velas:")
                     print(data_df)
                     
                     if not chart_seted:
                         chart.set(data_df)
-                        chart.show()
+                        chart.show(block=False)
                         chart_seted = True
                     else:
                         chart.update(data_df.iloc[-1])
-                    
+                        #return
             except Exception as e:
                 logging.error(f"Error: {e}")
             
-            time.sleep(0.05)
+            time.sleep(0.03)
         
     except Exception as e:
         logging.error(f"Error principal: {e}")
@@ -74,6 +72,7 @@ def main():
     finally:
         if 'api' in locals():
             api.stop_streaming(stream_id)
+            
         #chart.close()
 if __name__ == "__main__":
     main()

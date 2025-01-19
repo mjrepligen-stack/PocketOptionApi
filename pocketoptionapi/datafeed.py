@@ -34,12 +34,12 @@ class DataFeed:
         self._active_streams = {}  # {stream_id: {"asset": asset, "period": period, "active": True}}
         self._stream_counter = 0
 
-    def generate_stream_id(self, asset: str) -> str:
+    def generate_stream_id(self, asset: str, period: int) -> str:
         """
         Genera un ID único para un nuevo stream.
         """
-        self._stream_counter += 1
-        return f"stream_{self._stream_counter}_{asset}"
+        
+        return f"{asset}_{period}"
 
     def register_stream(self, asset: str, period: int) -> str:
         """
@@ -52,7 +52,7 @@ class DataFeed:
         Returns:
             str: ID único del stream
         """
-        stream_id = self.generate_stream_id(asset)
+        stream_id = self.generate_stream_id(asset, period)
         self._active_streams[stream_id] = {
             "asset": asset,
             "period": period,
@@ -73,6 +73,7 @@ class DataFeed:
         """
         if stream_id in self._active_streams:
             self._active_streams[stream_id]["active"] = False
+            self._candle_buffer[stream_id].clear()
             return True
         return False
 
@@ -127,41 +128,56 @@ class DataFeed:
                 # Calcular el inicio del período actual
                 current_period_start = (timestamp // period) * period
                 
-                # Si no hay vela actual, crear una nueva
-                if current_candle is None:
-                    candle_buffer["current_candle"] = self._init_candle(timestamp, price, period)
-                    logger.debug(f"Nueva vela iniciada para {asset} en período {period}s")
-                    continue
+                # Verificar si necesitamos crear una nueva vela
+                is_new_period = (current_candle is None or 
+                               timestamp >= current_candle["timestamp"] + period or 
+                               timestamp < current_candle["timestamp"])
                 
-                # Si el tick pertenece a un nuevo período
-                if timestamp >= current_candle["timestamp"] + period:
-                    # Guardar la vela completada
-                    candle_buffer["completed_candles"].append(current_candle)
-                    logger.debug(f"Vela completada para {asset} en período {period}s")
-                    # Iniciar nueva vela
-                    candle_buffer["current_candle"] = self._init_candle(timestamp, price, period)
+                if is_new_period:
+                    # Si hay vela actual y pertenece a un período anterior, guardarla
+                    if current_candle is not None and current_candle["timestamp"] < current_period_start:
+                        candle_buffer["completed_candles"].append(current_candle.copy())
+                        logger.debug(f"Vela completada y guardada: {datetime.fromtimestamp(current_candle['timestamp'])} "
+                                   f"O={current_candle['open']} C={current_candle['close']} "
+                                   f"H={current_candle['high']} L={current_candle['low']}")
+                    
+                    # Crear nueva vela para el período actual
+                    candle_buffer["current_candle"] = {
+                        "timestamp": current_period_start,
+                        "open": price,
+                        "high": price,
+                        "low": price,
+                        "close": price
+                    }
+                    logger.debug(f"Nueva vela creada para período: {datetime.fromtimestamp(current_period_start)}")
                 else:
-                    # Actualizar la vela actual
-                    candle_buffer["current_candle"] = self._update_candle(current_candle, timestamp, price)
-            
-            logger.debug(f"Tick procesado para {asset}: timestamp={timestamp}, price={price}")
+                    # Actualizar la vela actual con el nuevo precio
+                    current_candle["high"] = max(current_candle["high"], price)
+                    current_candle["low"] = min(current_candle["low"], price)
+                    current_candle["close"] = price
+                    
+                    logger.debug(f"Vela actual actualizada: {datetime.fromtimestamp(current_candle['timestamp'])} "
+                               f"O={current_candle['open']} C={current_candle['close']} "
+                               f"H={current_candle['high']} L={current_candle['low']}")
             
         except Exception as e:
             logger.error(f"Error actualizando stream buffer: {e}")
             logger.exception(e)
 
-    def get_stream_data(self, stream_id: str, limit: int = None) -> List[dict]:
+    def get_stream_data(self, asset: str, period: int, limit: int = None) -> List[dict]:
         """
         Obtiene las velas más recientes del stream para un ID específico.
         
         Args:
-            stream_id: ID del stream
+            asset: Símbolo del activo
+            period: Período en segundos
             limit: Número máximo de velas a retornar (None para todas)
             
         Returns:
-            Lista de velas ordenadas por timestamp
+            Lista de velas ordenadas por timestamp sin duplicados
         """
         try:
+            stream_id = self.generate_stream_id(asset, period)
             if not self.is_stream_active(stream_id):
                 return []
                 
@@ -177,13 +193,19 @@ class DataFeed:
             if current_candle is not None:
                 completed_candles.append(current_candle)
             
+            # Eliminar duplicados manteniendo la última ocurrencia de cada timestamp
+            unique_candles = {}
+            for candle in completed_candles:
+                unique_candles[candle["timestamp"]] = candle
+            
             # Ordenar por timestamp
-            sorted_candles = sorted(completed_candles, key=lambda x: x["timestamp"])
+            sorted_candles = sorted(unique_candles.values(), key=lambda x: x["timestamp"])
             
             # Aplicar límite si se especifica
             if limit and limit > 0:
                 sorted_candles = sorted_candles[-limit:]
             
+            logger.debug(f"get_stream_data > Retornando {len(sorted_candles)} velas únicas para stream {stream_id}")
             return sorted_candles
             
         except Exception as e:
@@ -383,8 +405,7 @@ class DataFeed:
             "open": price,
             "high": price,
             "low": price,
-            "close": price,
-            "volume": 1
+            "close": price
         }
 
     def _update_candle(self, candle: dict, timestamp: float, price: float) -> dict:
@@ -402,5 +423,74 @@ class DataFeed:
         candle["high"] = max(candle["high"], price)
         candle["low"] = min(candle["low"], price)
         candle["close"] = price
-        candle["volume"] += 1
-        return candle 
+        return candle
+
+    def update_candles(self, asset: str, period: int, candles: List[dict]) -> None:
+        """
+        Actualiza el buffer de velas completadas para un stream específico.
+        Evita duplicados verificando el timestamp antes de agregar una vela.
+
+        Args:
+            asset: El símbolo del activo
+            period: El período de las velas en segundos
+            candles: Lista de velas ordenadas por timestamp
+        """
+        try:
+            # Buscar el stream_id correspondiente al asset y period
+            stream_id = None
+            for sid, info in self._active_streams.items():
+                if info["active"] and info["asset"] == asset and info["period"] == period:
+                    stream_id = sid
+                    break
+
+            if not stream_id:
+                logger.warning(f"No hay stream activo para {asset} con período {period}")
+                return
+
+            # Inicializar el buffer de velas si no existe
+            if stream_id not in self._candle_buffer:
+                self._candle_buffer[stream_id] = {
+                    "current_candle": None,
+                    "completed_candles": deque(maxlen=self._stream_buffer_size)
+                }
+
+            # Obtener timestamps existentes
+            existing_timestamps = {c["timestamp"] for c in self._candle_buffer[stream_id]["completed_candles"]}
+            logger.debug(f"Timestamps existentes: {len(existing_timestamps)}")
+
+            # Agregar solo velas no duplicadas al buffer
+            candles_added = 0
+            for candle in candles:
+                if candle["timestamp"] not in existing_timestamps:
+                    self._candle_buffer[stream_id]["completed_candles"].append(candle)
+                    existing_timestamps.add(candle["timestamp"])
+                    candles_added += 1
+                    logger.debug(f"Nueva vela agregada: {datetime.fromtimestamp(candle['timestamp'])} "
+                               f"O={candle['open']} C={candle['close']} H={candle['high']} L={candle['low']}")
+
+            # Ordenar las velas por timestamp
+            sorted_candles = sorted(
+                self._candle_buffer[stream_id]["completed_candles"],
+                key=lambda x: x["timestamp"]
+            )
+            
+            # Verificar orden y continuidad
+            for i in range(len(sorted_candles)-1):
+                time_diff = sorted_candles[i+1]["timestamp"] - sorted_candles[i]["timestamp"]
+                if time_diff != period:
+                    logger.warning(f"Posible hueco en las velas: diferencia de {time_diff}s entre "
+                                 f"{datetime.fromtimestamp(sorted_candles[i]['timestamp'])} y "
+                                 f"{datetime.fromtimestamp(sorted_candles[i+1]['timestamp'])}")
+
+            self._candle_buffer[stream_id]["completed_candles"] = deque(
+                sorted_candles,
+                maxlen=self._stream_buffer_size
+            )
+
+            logger.info(f"Buffer de velas actualizado para stream {stream_id}: "
+                       f"{len(self._candle_buffer[stream_id]['completed_candles'])} velas totales, "
+                       f"{candles_added} nuevas velas agregadas")
+
+        except Exception as e:
+            logger.error(f"Error actualizando buffer de velas: {e}")
+            logger.exception(e) 

@@ -107,7 +107,7 @@ class PocketOption:
         self._stream_thread = None
         self._stream_active = False
 
-        self._history_data_event = threading.Event()
+        
 
     def _init_trading_data(self):
         """Inicializa las estructuras de datos para trading."""
@@ -712,130 +712,253 @@ class PocketOption:
             logger.error(f"Error procesando OHLC: {str(e)}")
             return pd.DataFrame()
 
-    def get_candles_full(
-        self, 
-        active: str, 
-        period: int, 
-        start_time: Optional[int] = None,
-        offset: Optional[int] = None,
-        count_request: int = 1,
-    ) -> Optional[pd.DataFrame]:
-        """
-        Obtiene datos históricos de velas completos, combinando datos históricos con tiempo real.
-        """
-        try:
-            logger.debug("Iniciando get_candles_full")
-            # Obtener datos históricos del servidor
-            historical_df = self._get_historical_candles(active, period, start_time, offset, count_request)
-            logger.debug(f"Datos históricos obtenidos: {historical_df is not None}")
+    # def get_candles_full(
+    #     self, 
+    #     active: str, 
+    #     period: int, 
+    #     start_time: Optional[int] = None,
+    #     offset: Optional[int] = None,
+    #     count_request: int = 1,
+    # ) -> Optional[pd.DataFrame]:
+    #     """
+    #     Obtiene datos históricos de velas completos, combinando datos históricos con tiempo real.
+    #     """
+    #     try:
+    #         logger.debug("Iniciando get_candles_full")
+    #         # Obtener datos históricos del servidor
+    #         historical_df = self._get_historical_candles(active, period, start_time, offset, count_request)
+    #         logger.debug(f"Datos históricos obtenidos: {historical_df is not None}")
             
-            # Combinar con datos en tiempo real del DataFeed
-            if historical_df is not None:
-                logger.debug("Combinando con datos en tiempo real")
-                result = self.datafeed.merge_with_historical(active, period, historical_df)
-                logger.debug(f"Combinación completada: {result is not None}")
-                return result
+    #         # Combinar con datos en tiempo real del DataFeed
+    #         if historical_df is not None:
+    #             logger.debug("Combinando con datos en tiempo real")
+    #             result = self.datafeed.merge_with_historical(active, period, historical_df)
+    #             logger.debug(f"Combinación completada: {result is not None}")
+    #             return result
             
-            # Si no hay datos históricos, intentar usar solo datos en tiempo real
-            logger.debug("Intentando obtener solo datos en tiempo real")
-            return self.datafeed.get_data(active, period, start_time)
+    #         # Si no hay datos históricos, intentar usar solo datos en tiempo real
+    #         logger.debug("Intentando obtener solo datos en tiempo real")
+    #         return self.datafeed.get_data(active, period, start_time)
             
-        except Exception as e:
-            logger.error(f"Error obteniendo velas: {str(e)}", exc_info=True)
-            return None
+    #     except Exception as e:
+    #         logger.error(f"Error obteniendo velas: {str(e)}", exc_info=True)
+    #         return None
 
-    def _get_historical_candles(
+    def get_historical_candles(
         self, 
         active: str, 
         period: int, 
         start_time: Optional[int] = None,
         offset: Optional[int] = None,
         count_request: int = 1,
-    ) -> Optional[pd.DataFrame]:
+    ) -> Optional[list]:
         """
         Obtiene datos históricos del servidor.
+        Para períodos >= 60s retorna lista de velas OHLC.
+        Para períodos < 60s procesa ticks y los convierte a velas.
+        Si start_time es None, rellena con datos recientes del buffer.
         """
         all_data = []
+        buffer_data = None
         
         try:
             # Ajustar el offset según el período
             if offset is None:
                 offset = 2000 if period < 60 else 9000
             else:
-                # Asegurar que no exceda el límite
                 offset = min(offset, 2000 if period < 60 else 9000)
             
             logger.debug(f"Usando offset={offset} para período de {period} segundos")
             
             # Determinar tiempo inicial
+            current_server_time = self.api.time_sync.server_time_reference
             if start_time is None:
-                current_time = self.api.sync.get_synced_time()
-                time_start = (current_time // period) * period if period >= 60 else current_time
+                time_start = (current_server_time // period) * period if period >= 60 else current_server_time
             else:
                 time_start = int(start_time)
             
             current_time = time_start
-            
+
+        except Exception as e:
+            logger.error(f"Error obteniendo datos: {str(e)}")
+            return None
+
+        try:
+            # Para la primera iteración y períodos >= 60, intentar rellenar con datos del buffer
+            if period >= 60 and start_time is None:
+                # Buscar o iniciar stream
+                stream_id = None
+                stream_success = False
+                
+                # Primero buscar stream existente
+                for sid, info in self.api.datafeed._active_streams.items():
+                    if info["asset"] == active and info["period"] == period:
+                        stream_id = sid
+                        stream_success = True
+                        logger.debug(f"Stream encontrado: {stream_id}")
+                        break
+                
+                # Si no hay stream, intentar iniciarlo
+                if stream_id is None:
+                    logger.debug(f"Iniciando nuevo stream para {active} período {period}")
+                    stream_success = self.start_streaming(active, period)
+                    if stream_success:
+                        # Esperar un momento para que lleguen datos iniciales
+                        time.sleep(0.5)
+                
+                # Obtener datos del buffer si el stream está activo
+                if stream_success:
+                    buffer_data = self.api.datafeed.get_stream_data(active, period, limit=20)
+                    if buffer_data:
+                        logger.debug(f"Obtenidos {len(buffer_data)} datos del buffer")
+                        
+                        # Normalizar datos del buffer (timestamp -> time)
+                        normalized_buffer = []
+                        for candle in buffer_data:
+                            try:
+                                normalized_candle = candle.copy()
+                                if "timestamp" in normalized_candle:
+                                    normalized_candle["time"] = int(normalized_candle.pop("timestamp"))
+                                    normalized_buffer.append(normalized_candle)
+                                elif "time" in normalized_candle:
+                                    normalized_candle["time"] = int(normalized_candle["time"])
+                                    normalized_buffer.append(normalized_candle)
+                            except Exception as e:
+                                logger.error(f"Error normalizando vela: {e}")
+                                continue
+                        
+                        if normalized_buffer:
+                            # Filtrar velas completas (anteriores al tiempo actual)
+                            current_candle_time = (current_server_time // period) * period
+                            completed_candles = [
+                                candle for candle in normalized_buffer 
+                                if candle["time"] < current_candle_time
+                            ]
+                            
+                            if completed_candles:
+                                latest_time = max(candle["time"] for candle in completed_candles)
+                                logger.info(f"Agregando {len(completed_candles)} velas completas del buffer hasta {latest_time}")
+                                all_data.extend(completed_candles)
+                            else:
+                                logger.debug("No hay velas completas en el buffer")
+                    else:
+                        logger.debug("Buffer vacío")
+                else:
+                    logger.warning("No se pudo iniciar el stream")
+
             # Realizar peticiones de datos históricos
             for i in range(count_request):
                 if not self.check_connect():
                     logger.error("No hay conexión al servidor")
                     return None
                 
-                try:
-                    # Limpiar datos anteriores y evento
-                    self.api.history_data = None
-                    self._history_data_event.clear()
+                
                     
-                    # Enviar petición de velas
-                    self.api.getcandles(active, period, offset, int(current_time))
+                # Limpiar datos anteriores y evento
+                self.api.history_data = None
+                self.api._history_data_event.clear()
                     
-                    # Esperar respuesta usando Event
-                    if self._history_data_event.wait(timeout=10):
-                        if self.api.history_data:
-                            # Procesar datos según el período
-                            if period < 60:
-                                processed_data = self._process_tick_data({"data": self.api.history_data})
-                            else:
-                                processed_data = self._process_ohlc_data({"data": self.api.history_data})
+                # Enviar petición de velas
+                self.api.getcandles(active, period, offset, int(current_time))
+                    
+                # Esperar respuesta usando Event
+                if self.api._history_data_event.wait(timeout=10):
+                    if self.api.history_data and "data" in self.api.history_data:
+                        data = self.api.history_data["data"]
                             
-                            if processed_data is not None and not processed_data.empty:
-                                all_data.append(processed_data)
-                                logger.debug(f"Obtenidos {len(processed_data)} registros en petición {i+1}")
-                                
-                                # Actualizar el tiempo para la siguiente petición
+                        if period < 60:
+                            # Procesar ticks a velas
+                            candles = self._process_ticks_to_candles(data, period)
+                            if candles:
+                                all_data.extend(candles)
+                                logger.debug(f"Procesados {len(data)} ticks en {len(candles)} velas")
+                                    
                                 if i < count_request - 1:
-                                    oldest_time = int(processed_data['timestamp'].min())
+                                    oldest_time = min(candle["time"] for candle in candles)
                                     current_time = oldest_time - period
-                            else:
-                                logger.warning("No se obtuvieron datos de velas en esta iteración")
+                        else:
+                            # Datos ya vienen en formato OHLC
+                            if data:
+                                all_data.extend(data)
+                                logger.info(f"Obtenidas {len(data)} velas OHLC {max(candle['time'] for candle in all_data)}")
+                                    
+                                if i < count_request - 1:
+                                    oldest_time = min(candle["time"] for candle in data)
+                                    current_time = oldest_time - period
+                            
                     else:
-                        logger.error("Timeout esperando datos históricos")
+                        logger.warning("No se obtuvieron datos en esta iteración")
+                else:
+                    logger.error("Timeout esperando datos históricos")
                     
-                except Exception as e:
-                    logger.error(f"Error obteniendo velas: {str(e)}")
-                    continue
             
-            if not all_data:
-                logger.error("No se obtuvieron datos de velas")
-                return None
+                if not all_data:
+                    logger.error("No se obtuvieron datos")
+                    return None
             
-            # Combinar todos los datos
-            final_df = pd.concat(all_data, ignore_index=True)
+                # Asegurar que todas las velas tengan la clave "time"
+                for candle in all_data:
+                    if "timestamp" in candle and "time" not in candle:
+                        candle["time"] = candle.pop("timestamp")
             
-            # Ordenar y eliminar duplicados
-            final_df.sort_values('time', ascending=True, inplace=True)
-            final_df.drop_duplicates(subset=['time'], keep='last', inplace=True)
-            final_df.reset_index(drop=True, inplace=True)
+            # Ordenar por tiempo y eliminar duplicados
+            all_data.sort(key=lambda x: x.get("time", 0))
+            seen = {}
+            unique_data = []
+            for candle in reversed(all_data):
+                if candle.get("time") not in seen:
+                    seen[candle.get("time")] = True
+                    unique_data.append(candle)
+            unique_data.reverse()
             
-            logger.debug(f"Total de registros procesados: {len(final_df)}")
-            logger.debug(f"Rango de tiempo: {final_df['time'].min()} a {final_df['time'].max()}")
+            logger.debug(f"Total de registros procesados: {len(unique_data)}")
+            if unique_data:
+                logger.debug(f"Rango de tiempo: {unique_data[0]['time']} a {unique_data[-1]['time']}")
             
-            return final_df
+            return unique_data
             
         except Exception as e:
             logger.error(f"Error procesando datos de velas: {str(e)}", exc_info=True)
             return None
+
+    def _process_ticks_to_candles(self, ticks: list, period: int) -> list:
+        """
+        Procesa una lista de ticks y los convierte en velas OHLC.
+        """
+        if not ticks:
+            return []
+            
+        candles = []
+        current_candle = None
+        
+        for tick in sorted(ticks, key=lambda x: x["time"]):
+            tick_time = tick["time"]
+            candle_time = (tick_time // period) * period
+            
+            if current_candle is None or candle_time > current_candle["time"]:
+                # Si hay una vela actual, guardarla
+                if current_candle is not None:
+                    candles.append(current_candle)
+                
+                # Iniciar nueva vela
+                current_candle = {
+                    "time": candle_time,
+                    "open": tick["price"],
+                    "high": tick["price"],
+                    "low": tick["price"],
+                    "close": tick["price"]
+                }
+            else:
+                # Actualizar vela actual
+                current_candle["high"] = max(current_candle["high"], tick["price"])
+                current_candle["low"] = min(current_candle["low"], tick["price"])
+                current_candle["close"] = tick["price"]
+        
+        # Agregar última vela si existe
+        if current_candle is not None:
+            candles.append(current_candle)
+            
+        return candles
 
     def process_30_second_data(self, df: pd.DataFrame, period: int) -> pd.DataFrame:
         """
@@ -990,7 +1113,7 @@ class PocketOption:
             while time.time() - wait_start < 5:  # Esperar máximo 5 segundos
                 if hasattr(self.api, stream_key):
                     logger.info(f"Stream registrado con ID: {stream_id}")
-                    return stream_id
+                    return True if stream_id else False
                 time.sleep(0.1)
             
             logger.warning("No se recibieron datos iniciales del stream")
@@ -1022,7 +1145,7 @@ class PocketOption:
             logger.error(f"Error deteniendo stream: {str(e)}")
             return False
 
-    def get_stream_data(self, stream_id: str, limit: int = None) -> Optional[List[dict]]:
+    def get_stream_data(self, asset: str, period: int, limit: int = 1) -> Optional[List[dict]]:
         """
         Obtiene los datos del stream.
         
@@ -1034,7 +1157,7 @@ class PocketOption:
             Optional[List[dict]]: Lista de ticks o None si hay error
         """
         try:
-            return self.api.datafeed.get_stream_data(stream_id, limit)
+            return self.api.datafeed.get_stream_data(asset, period, limit)
         except Exception as e:
             logger.error(f"Error obteniendo datos del stream: {str(e)}")
             return None
@@ -1079,22 +1202,71 @@ class PocketOption:
         """
         return self.api.datafeed.get_ticks_data(active)
 
-    def get_candles(self, active: str, period: int, count: int = 500) -> Optional[pd.DataFrame]:
+    def get_candles(self, active: str, period: int, start_time: Optional[int] = None, end_time: Optional[int] = None) -> Optional[pd.DataFrame]:
         """
         Obtiene los datos de velas para un activo y período específicos.
         
         Args:
             active (str): El símbolo del activo
             period (int): Período de las velas en segundos
-            count (int): Número de velas a obtener
+            start_time (Optional[int]): Timestamp inicial para los datos históricos
+            end_time (Optional[int]): Timestamp final para los datos históricos
             
         Returns:
             Optional[pd.DataFrame]: DataFrame con los datos de las velas o None si hay error
         """
         try:
-            return self.get_candles_full(active, period, offset=count)
+            logger.info(f"Solicitando velas para {active} período {period}s")
+            
+            # 1. Iniciar stream si no existe
+            stream_id = None
+            for sid, info in self.datafeed._active_streams.items():
+                if info["active"] and info["asset"] == active and info["period"] == period:
+                    stream_id = sid
+                    break
+                
+            if not stream_id:
+                logger.info("No hay stream activo, iniciando uno nuevo")
+                stream_id = self.start_streaming(active, period)
+                if not stream_id:
+                    logger.error("No se pudo iniciar el stream")
+                    return None
+                
+            # 2. Solicitar datos históricos
+            historical_df = self._get_historical_candles(active, period, start_time)
+            if historical_df is None:
+                logger.warning("No se pudieron obtener datos históricos")
+                return None
+            
+            # 3. Obtener datos recientes del buffer
+            recent_data = self.datafeed.get_stream_data(stream_id)
+            if not recent_data:
+                logger.warning("No hay datos recientes en el buffer")
+                return historical_df
+            
+            # 4. Verificar y completar datos faltantes
+            if end_time:
+                last_historical = historical_df[-1]["time"]
+                first_recent = recent_data[0]["time"]
+                
+                if last_historical < first_recent:
+                    logger.info(f"Hay un gap entre datos históricos y recientes: {last_historical} -> {first_recent}")
+                    # Rellenar con datos del buffer si es posible
+                    gap_data = [candle for candle in recent_data if last_historical < candle["time"] <= end_time]
+                    if gap_data:
+                        gap_df = pd.DataFrame(gap_data)
+                        gap_df["time"] = pd.to_datetime(gap_df["time"], unit="s")
+                        gap_df.set_index("time", inplace=True)
+                        historical_df = pd.concat([historical_df, gap_df])
+            
+            # 5. Ordenar y eliminar duplicados
+            historical_df = historical_df.sort_index()
+            historical_df = historical_df[~historical_df.index.duplicated(keep="last")]
+            
+            return historical_df
+            
         except Exception as e:
-            logger.error(f"Error obteniendo velas: {e}")
+            logger.error(f"Error en get_candles: {e}")
             return None
 
     def is_time_synced(self) -> bool:
