@@ -94,6 +94,10 @@ class WebsocketClient:
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
         self.base_delay = 1  # Delay base para reconexión exponencial
+        
+        # Eventos para esperar respuestas
+        self._order_event = asyncio.Event()
+        self.orders_data = {}  # Almacena información de órdenes
 
     def _initialize_state(self) -> None:
         """Inicializa las variables de estado."""
@@ -510,22 +514,53 @@ class WebsocketClient:
             Datos decodificados y procesados
         """
         try:
-            # Decodificar datos binarios a texto
             decoded_data = binary_data.decode('utf-8')
-            # Convertir a objeto Python
             data = json.loads(decoded_data)
             
             logger.debug(f"Mensaje binario decodificado ({msg_type}): {json.dumps(data)}")
+
             
-            # Procesar según tipo de mensaje
-            if msg_type == "updateStream":
+            
+            if msg_type == "successopenOrder":
+                if isinstance(data, dict):
+                    # Almacenar datos de la orden
+                    order_id = data.get("id")
+                    if order_id:
+                        self.orders_data[order_id] = data
+                        logger.debug(f"Orden registrada: {order_id}")
+                        
+                    # Actualizar variables globales para compatibilidad
+                    global_value.order_data = data
+                    global_value.result = True
+                    
+                    # Notificar que tenemos respuesta
+                    self.api._order_open_event.set()
+                    
+                    logger.debug(f"successopenOrder > Orden procesada: {json.dumps(data, indent=4)}")
+                else:
+                    logger.warning(f"successopenOrder > Datos no válidos: {data}")
+                    global_value.result = False
+                    self.api._order_open_event.set()
+                return data
+            
+            elif msg_type == "successauth":
+                logger.debug(f"successauth > Autenticación exitosa: {data}")
+                try:
+                    global_value.account_id = data.get("accountId")
+                    await self.on_open()
+                    await self._send_post_auth_messages()
+                except Exception as e:
+                    logger.error(f"msg_type: {msg_type} => Error enviando mensajes: {e}")
+                return data
+
+            elif msg_type == "updateStream":
                 if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
                     stream_data = data[0]
                     if len(stream_data) >= 3:
                         asset, timestamp, price = stream_data
                         self.api.updateStream = True
                         # Sincronizar tiempo
-                        self.api.time_sync.synchronize(int(timestamp))
+                        self.api.time_sync.synchronize(timestamp)
                         
                         # Crear estructura de datos del stream
                         stream_update = {
@@ -549,7 +584,22 @@ class WebsocketClient:
                 else:
                     logger.warning(f"loadHistoryPeriod > Datos no válidos: {data}")
                     return None
+                
+            elif msg_type == "successcloseOrder":
+                logger.debug(f"successcloseOrder > Orden cerrada exitosamente: {json.dumps(data, indent=4)}")
+                if isinstance(data, dict) and "deals" in data and isinstance(data["deals"], list):
+                    # Almacenar los datos en el formato correcto
+                    for deal in data["deals"]:
+                        if "id" in deal:
+                            deal_id = deal["id"]
+                            # Almacenar los datos en el formato especificado
+                            self.api._order_results[deal_id] = {
+                                "deals": [deal]  # Mantener la estructura exacta
+                            }
+                            logger.debug(f"successcloseOrder > Orden registrada: {deal_id}")
+                return data
                     
+
             elif msg_type == "updateAssets":
                 if isinstance(data, list):
                     assets_info = []
@@ -579,7 +629,7 @@ class WebsocketClient:
                     logger.debug(f"Marcador de stream establecido: {stream_key}")
                     
                     if isinstance(data, dict) and "asset" in data:
-                        logger.info(f"updateHistoryNew > Recibidos datos para {data['asset']} con período {data.get('period')}")
+                        logger.debug(f"updateHistoryNew > Recibidos datos para {data['asset']} con período {data.get('period')}")
                         
                         processed_candle = {
                             "asset": data["asset"],
@@ -607,14 +657,14 @@ class WebsocketClient:
                                 # Verificar orden de timestamps
                                 timestamps = [c["timestamp"] for c in processed_candle["candles"]]
                                 is_ordered = all(timestamps[i] <= timestamps[i+1] for i in range(len(timestamps)-1))
-                                logger.info(f"Velas ordenadas por tiempo: {is_ordered}")
+                                logger.debug(f"Velas ordenadas por tiempo: {is_ordered}")
                                 
                                 await self.api.process_candle_update(
                                     processed_candle["asset"],
                                     processed_candle["period"],
                                     processed_candle["candles"]
                                 )
-                                logger.info(f"updateHistoryNew > Enviadas {len(processed_candle['candles'])} velas al datafeed")
+                                logger.debug(f"updateHistoryNew > Enviadas {len(processed_candle['candles'])} velas al datafeed")
                         
                         # Luego procesar ticks del historial
                         if "history" in data:
@@ -636,11 +686,12 @@ class WebsocketClient:
                                     await self.api.process_stream_update(processed_tick)
                                     ticks_processed += 1
                                     last_timestamp = current_timestamp
+                                    self.api.time_sync.synchronize(current_timestamp)
                                     
                                     if ticks_processed % 100 == 0:
                                         logger.debug(f"Procesados {ticks_processed} ticks")
 
-                            logger.info(f"updateHistoryNew > Procesados {ticks_processed} ticks históricos")
+                            logger.debug(f"updateHistoryNew > Procesados {ticks_processed} ticks históricos")
 
                         logger.debug(f"updateHistoryNew > Historial procesado para {processed_candle['asset']}: {len(processed_candle['candles'])} velas")
                         return processed_candle
@@ -648,15 +699,18 @@ class WebsocketClient:
                         logger.warning(f"updateHistoryNew > Datos no válidos o sin asset: {data}")
                 except Exception as e:
                     logger.error(f"Error procesando updateHistoryNew: {e}")
+
+            else:
+                logger.info(f"_decode_binary_message > Mensaje binario no manejado: {msg_type}")
             
             return data
             
         except json.JSONDecodeError as e:
-            logger.error(f"on_message > Error decodificando mensaje binario: {e}")
+            logger.error(f"_decode_binary_message > Error decodificando mensaje binario: {e}")
             logger.debug(f"Datos binarios raw: {binary_data}")
             return None
         except Exception as e:
-            logger.error(f"on_message > Error procesando mensaje binario: {e}")
+            logger.error(f"_decode_binary_message > Error procesando mensaje binario: {e}")
             return None
 
     async def _handle_451_message(self, message: str) -> None:
@@ -671,25 +725,25 @@ class WebsocketClient:
             json_part = message.split("-", 1)[1]
             msg_data = json.loads(json_part)
             msg_type = msg_data[0]
-            logger.debug(f"Tipo de mensaje 451: {msg_type}")
+            logger.debug(f"_handle_451_message > Tipo de mensaje 451: {msg_type}")
             
             # Esperar mensaje binario si hay placeholder
             if len(msg_data) > 1 and isinstance(msg_data[1], dict) and msg_data[1].get("_placeholder"):
                 try:
                     binary_data = await asyncio.wait_for(self.websocket.recv(), timeout=5)
                     if isinstance(binary_data, bytes):
-                        logger.debug(f"Recibido mensaje binario para {msg_type}")
+                        logger.debug(f"_handle_451_message > Recibido mensaje binario para {msg_type}")
                         decoded_data = await self._decode_binary_message(binary_data, msg_type)
                         
                         # Procesar datos decodificados según tipo
                         handlers = {
-                            "successauth": self._handle_auth_success,
+                           # "successauth": self._handle_auth_success,
                             "updateAssets": self._handle_assets_update,
                             "successupdateBalance": self._handle_balance_success,
-                            "successopenOrder": self._handle_open_order_success,
+                           # "successopenOrder": self._handle_open_order_success,
                             "updateClosedDeals": self._handle_closed_deals,
-                            "successcloseOrder": self._handle_close_order_success,
-                            "loadHistoryPeriod": self._handle_history_period,
+                           # "successcloseOrder": self._handle_close_order_success,
+                           # "loadHistoryPeriod": self._handle_history_period,
                             "updateStream": self._handle_stream_success,
                             "updateHistoryNew": self._handle_history_new
                         }
@@ -697,17 +751,18 @@ class WebsocketClient:
                         if msg_type in handlers:
                             await handlers[msg_type](decoded_data)
                         else:
-                            logger.warning(f"Tipo de mensaje 451 no manejado: {msg_type}")
+                            #logger.warning(f"Tipo de mensaje 451 no manejado: {msg_type}")
+                            pass
                             
                 except asyncio.TimeoutError:
-                    logger.warning(f"Timeout esperando datos binarios para {msg_type}")
+                    logger.warning(f"_handle_451_message > Timeout esperando datos binarios para {msg_type}")
                     return
                 except Exception as e:
-                    logger.error(f"Error recibiendo datos binarios: {e}")
+                    logger.error(f"_handle_451_message > Error recibiendo datos binarios: {e}")
                     return
 
         except Exception as e:
-            logger.error(f"Error procesando mensaje 451: {e}")
+            logger.error(f"_handle_451_message > Error procesando mensaje 451: {e}")
 
     async def _handle_assets_update(self, msg_data: List[Any]) -> None:
         """
@@ -716,7 +771,7 @@ class WebsocketClient:
         Args:
             msg_data: Datos del mensaje
         """
-        logger.debug("Recibida actualización de activos")
+        logger.debug("_handle_assets_update > Recibida actualización de activos")
         # Aquí puedes procesar los datos binarios de activos si es necesario
 
     async def _handle_auth_success(self, msg_data: List[Any]) -> None:
@@ -726,7 +781,7 @@ class WebsocketClient:
         Args:
             msg_data: Datos del mensaje
         """
-        logger.info("Autenticación exitosa")
+        logger.info("_handle_auth_success > Autenticación exitosa")
         await self.on_open()
         await self._send_post_auth_messages()
 
@@ -746,10 +801,57 @@ class WebsocketClient:
         global_value.balance_updated = True
         logger.debug("_handle_balance_success > Balance actualizado exitosamente")
 
-    async def _handle_open_order_success(self, _: List[Any]) -> None:
-        """Maneja la apertura exitosa de una orden."""
-        global_value.result = True
-        logger.debug("_handle_open_order_success > Orden abierta exitosamente")
+    async def _handle_open_order_success(self, data):
+        """
+        Maneja la respuesta exitosa de una orden abierta.
+        
+        Args:
+            data: Diccionario con la información de la orden
+            {
+                "id": str,                # ID único de la orden
+                "openTime": str,          # Hora de apertura
+                "closeTime": str,         # Hora de cierre esperada
+                "openTimestamp": int,     # Timestamp de apertura
+                "closeTimestamp": int,    # Timestamp de cierre esperado
+                "uid": int,               # ID del usuario
+                "isDemo": int,            # Si es cuenta demo
+                "amount": float,          # Monto de la orden
+                "profit": float,          # Beneficio esperado
+                "percentProfit": float,   # Porcentaje de beneficio
+                "percentLoss": float,     # Porcentaje de pérdida
+                "openPrice": float,       # Precio de apertura
+                "asset": str,             # Activo
+                "command": int,           # Tipo de orden (0=call, 1=put)
+                "currency": str           # Moneda
+            }
+        """
+        try:
+            if isinstance(data, dict):
+                # Validar campos requeridos
+                required_fields = ["id", "openPrice", "amount", "asset", "command"]
+                if all(field in data for field in required_fields):
+                    # Actualizar variables globales
+                    global_value.order_data = data
+                    global_value.result = True
+                    
+                    # Registrar detalles de la orden
+                    direction = "call" if data["command"] == 0 else "put"
+                    logger.info(f"Orden abierta exitosamente:")
+                    logger.info(f"ID: {data['id']}")
+                    logger.info(f"Activo: {data['asset']}")
+                    logger.info(f"Dirección: {direction}")
+                    logger.info(f"Monto: {data['amount']} {data.get('currency', 'USD')}")
+                    logger.info(f"Precio de apertura: {data['openPrice']}")
+                else:
+                    logger.error("Respuesta de orden incompleta")
+                    global_value.result = False
+            else:
+                logger.error("Formato de respuesta inválido")
+                global_value.result = False
+                
+        except Exception as e:
+            logger.error(f"Error procesando orden: {str(e)}")
+            global_value.result = False
 
     async def _handle_closed_deals(self, _: List[Any]) -> None:
         """Maneja las operaciones cerradas."""

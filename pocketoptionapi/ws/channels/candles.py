@@ -40,6 +40,6 @@ class GetCandles(Base):
 
         data = ["loadHistoryPeriod", data]
 
-        logging.warning(data)
+        logging.debug(f"GetCandles > {data}")
 
         self.send_websocket_request(self.name, data)

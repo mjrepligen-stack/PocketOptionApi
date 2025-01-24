@@ -444,7 +444,7 @@ class DataFeed:
                     break
 
             if not stream_id:
-                logger.warning(f"No hay stream activo para {asset} con período {period}")
+                logger.warning(f"update_candles > No hay stream activo para {asset} con período {period}")
                 return
 
             # Inicializar el buffer de velas si no existe
@@ -456,7 +456,7 @@ class DataFeed:
 
             # Obtener timestamps existentes
             existing_timestamps = {c["timestamp"] for c in self._candle_buffer[stream_id]["completed_candles"]}
-            logger.debug(f"Timestamps existentes: {len(existing_timestamps)}")
+            logger.debug(f"update_candles > Timestamps existentes: {len(existing_timestamps)}")
 
             # Agregar solo velas no duplicadas al buffer
             candles_added = 0
@@ -465,7 +465,7 @@ class DataFeed:
                     self._candle_buffer[stream_id]["completed_candles"].append(candle)
                     existing_timestamps.add(candle["timestamp"])
                     candles_added += 1
-                    logger.debug(f"Nueva vela agregada: {datetime.fromtimestamp(candle['timestamp'])} "
+                    logger.debug(f"update_candles > Nueva vela agregada: {datetime.fromtimestamp(candle['timestamp'])} "
                                f"O={candle['open']} C={candle['close']} H={candle['high']} L={candle['low']}")
 
             # Ordenar las velas por timestamp
@@ -478,7 +478,7 @@ class DataFeed:
             for i in range(len(sorted_candles)-1):
                 time_diff = sorted_candles[i+1]["timestamp"] - sorted_candles[i]["timestamp"]
                 if time_diff != period:
-                    logger.warning(f"Posible hueco en las velas: diferencia de {time_diff}s entre "
+                    logger.warning(f"update_candles > Posible hueco en las velas: diferencia de {time_diff}s entre "
                                  f"{datetime.fromtimestamp(sorted_candles[i]['timestamp'])} y "
                                  f"{datetime.fromtimestamp(sorted_candles[i+1]['timestamp'])}")
 
@@ -487,10 +487,10 @@ class DataFeed:
                 maxlen=self._stream_buffer_size
             )
 
-            logger.info(f"Buffer de velas actualizado para stream {stream_id}: "
+            logger.info(f"update_candles > Buffer de velas actualizado para stream {stream_id}: "
                        f"{len(self._candle_buffer[stream_id]['completed_candles'])} velas totales, "
                        f"{candles_added} nuevas velas agregadas")
 
         except Exception as e:
-            logger.error(f"Error actualizando buffer de velas: {e}")
+            logger.error(f"update_candles > Error actualizando buffer de velas: {e}")
             logger.exception(e) 

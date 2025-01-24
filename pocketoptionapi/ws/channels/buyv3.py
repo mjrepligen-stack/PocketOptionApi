@@ -12,13 +12,7 @@ class Buyv3(Base):
 
     def __call__(self, amount, active, direction, duration, request_id):
 
-        # thank Darth-Carrotpie's code
-        # https://github.com/Lu-Yi-Hsun/iqoptionapi/issues/6
-        # exp = get_expiration_time(int(self.api.timesync.server_timestamps), duration)
-        """if idx < 5:
-            option = 3  # "turbo"
-        else:
-            option = 1  # "binary"""
+
         # Construir el diccionario
         data_dict = {
             "asset": active,
@@ -40,8 +34,6 @@ class Buyv3_by_raw_expired(Base):
 
     def __call__(self, price, active, direction, option, expired, request_id):
 
-        # thank Darth-Carrotpie's code
-        # https://github.com/Lu-Yi-Hsun/iqoptionapi/issues/6
 
         if option == "turbo":
             option_id = 3  # "turbo"

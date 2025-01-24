@@ -30,16 +30,16 @@ def main():
         asset = "AUDCAD_otc"
         period = 10
         
-        # Iniciar streaming
-        stream_id = api.start_streaming(asset, period)
-        if not stream_id:
-            raise Exception("Error al iniciar streaming")
+        # # Iniciar streaming
+        # stream_id = api.start_streaming(asset, period)
+        # if not stream_id:
+        #     raise Exception("Error al iniciar streaming")
         
         chart_seted = False
             
         while True:
             try:
-                data = api.get_stream_data(stream_id, limit=100)
+                data = api.get_stream_data(asset, period, limit=100)
                 if data and len(data) > 0:
                     # Crear DataFrame
                     data_df = pd.DataFrame(data)
@@ -71,7 +71,8 @@ def main():
         logging.info("Interrupción del usuario")
     finally:
         if 'api' in locals():
-            api.stop_streaming(stream_id)
+            #api.stop_streaming(stream_id)
+            pass
             
         #chart.close()
 if __name__ == "__main__":

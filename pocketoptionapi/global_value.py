@@ -17,3 +17,4 @@ balance_type = None
 balance_updated = None
 result = None
 order_data = {}
+account_id = None

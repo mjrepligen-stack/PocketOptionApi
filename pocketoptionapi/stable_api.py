@@ -97,7 +97,6 @@ class PocketOption:
         
         # Sistema de verificación de órdenes
         self._pending_orders = Queue()
-        self._order_results: Dict[str, dict] = {}
         self._check_win_thread = threading.Thread(target=self._check_win_worker, daemon=True)
         self._check_win_thread.start()
         
@@ -321,52 +320,110 @@ class PocketOption:
     def start_async(self):
         asyncio.run(self.api.connect())
 
-    def buy(self, amount: float, active: str, action: str, expirations: int) -> Tuple[bool, Optional[str]]:
+    def buy(self, amount: float, active: str, direction: str, expiration: int) -> Tuple[str, bool]:
         """
         Realiza una operación de compra.
+        
+        Args:
+            amount: Cantidad a invertir
+            active: Activo a operar
+            direction: Dirección ('call' o 'put')
+            expiration: Tiempo de expiración en segundos
+            
+        Returns:
+            Tuple[str, bool]: (ID de la orden, Estado de la operación)
+            - Si es exitosa: (ID de la orden, True)
+            - Si falla: ('', False)
         """
         try:
-            logger.debug(f"Iniciando compra: {action} {amount} en {active}")
+            logger.debug(f"Iniciando compra: {direction} {amount} en {active}")
+
+            request_id = direction + str(time.time())
+            
             # Reiniciar variables de estado
-            self.api.buy_multi_option = {}
-            self.api.buy_successful = None
-            req_id = "buy"
-
-            # Inicializar estructura de datos para la orden
-            if req_id not in self.api.buy_multi_option:
-                self.api.buy_multi_option[req_id] = {"id": None}
-            else:
-                self.api.buy_multi_option[req_id]["id"] = None
-
-            # Reiniciar datos globales
+            self.api._order_open_event.clear()
             global_value.order_data = None
-            global_value.result = None
-
+            
             # Enviar orden de compra
             logger.debug("Enviando orden al servidor...")
-            self.api.buyv3(amount, active, action, expirations, req_id)
-
+            self.api.buyv3(amount, active, direction, expiration, request_id)
+            
             # Esperar respuesta con timeout
-            start_time = time.time()
-            timeout = 5  # segundos
+            timeout = 1  # segundos
             
-            while time.time() - start_time < timeout:
-                if global_value.result is not None and global_value.order_data is not None:
-                    logger.debug(f"Orden completada: {global_value.order_data}")
-                    return global_value.result, global_value.order_data.get("id")
-                time.sleep(0.1)
-            
-                # Verificar si hubo error
-                if isinstance(global_value.order_data, dict) and "error" in global_value.order_data:
-                    logger.error(f"Error en la orden: {global_value.order_data['error']}")
-                    return False, None
+            if self.api._order_open_event.wait(timeout):
+                if global_value.order_data.get("requestId") == request_id:
+                    order_data = global_value.order_data
+                    logger.debug(f"Orden ejecutada exitosamente. ID: {order_data}")
+                    return order_data, True
+                else:
+                    error_msg = global_value.order_data.get("error", "Error desconocido") if isinstance(global_value.order_data, dict) else "Error en la orden"
+                    logger.error(f"Error en la orden: {error_msg}")
+                    return "", False
+                        
             
             logger.error("Timeout esperando respuesta de la orden")
-            return False, None
-            
+            return "", False
+                
         except Exception as e:
             logger.error(f"Error ejecutando orden: {str(e)}", exc_info=True)
-            return False, None
+            return "", False
+
+    def _check_win_internal(self, id_number: str, timeout: float = 120.0) -> Tuple[Optional[dict], str]:
+        """
+        Implementación interna de check_win.
+        
+        Returns:
+            Tuple[Optional[dict], str]: (datos de la orden, estado)
+            Los datos de la orden tienen el formato:
+            {
+                "deals": [{
+                    "id": str,
+                    "openTime": str,
+                    "closeTime": str,
+                    "openTimestamp": int,
+                    "closeTimestamp": int,
+                    "uid": int,
+                    "amount": float,
+                    "profit": float,
+                    "percentProfit": float,
+                    "percentLoss": float,
+                    "openPrice": float,
+                    "closePrice": float,
+                    "command": int,
+                    "asset": str,
+                    "isDemo": int,
+                    "currency": str,
+                    "amountUSD": float
+                }]
+            }
+        """
+        try:
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                try:
+                    # Intentar obtener los datos del resultado almacenado
+                    order_data = self.api._order_results.get(id_number)
+                    if order_data and "deals" in order_data:
+                        return order_data, "closed"
+                        
+                    # Si no hay datos almacenados, verificar la orden asíncrona
+                    order_info = self.get_async_order(id_number)
+                    if order_info:
+                        return {"deals": [order_info]}, "pending"
+                        
+                except Exception as e:
+                    logger.debug(f"Error temporal obteniendo orden: {str(e)}")
+                    pass
+                
+                time.sleep(0.1)
+            
+            logger.error(f"Timeout verificando orden {id_number}")
+            return None, "timeout"
+            
+        except Exception as e:
+            logger.error(f"Error verificando orden {id_number}: {str(e)}")
+            return None, "error"
 
     def _check_win_worker(self):
         """
@@ -384,23 +441,19 @@ class PocketOption:
                 callback = order_data.get('callback')
                 
                 # Verificar resultado
-                profit, status, close_time = self._check_win_internal(order_id)
+                result, status = self._check_win_internal(order_id)
                 
-                # Guardar resultado
-                result = {
-                    'id': order_id,
-                    'profit': profit,
-                    'status': status,
-                    'open_time': datetime.fromtimestamp(start_time).strftime('%Y-%m-%d %H:%M:%S'),
-                    'close_time': datetime.fromtimestamp(close_time).strftime('%Y-%m-%d %H:%M:%S') if close_time else None,
-                    'execution_time': time.time() - start_time
-                }
-                self._order_results[order_id] = result
+                # Si la orden está pendiente y no ha expirado, volver a ponerla en la cola
+                if status == "pending" and (time.time() - start_time) < 120:
+                    self._pending_orders.put(order_data)
+                    time.sleep(0.1)
+                    continue
+                
                 
                 # Llamar al callback si existe
-                if callback:
+                if callback and status != "pending":
                     try:
-                        callback(result)
+                        callback(result["deals"][0])
                     except Exception as e:
                         logger.error(f"Error en callback de orden {order_id}: {e}")
                     
@@ -408,36 +461,6 @@ class PocketOption:
                 logger.error(f"Error en worker de check_win: {e}")
             finally:
                 self._pending_orders.task_done()
-
-    def _check_win_internal(self, id_number: str, timeout: float = 120.0) -> Tuple[Optional[float], str, Optional[float]]:
-        """
-        Implementación interna de check_win.
-        
-        Returns:
-            Tuple[Optional[float], str, Optional[float]]: (ganancia/pérdida, estado, timestamp de cierre)
-        """
-        try:
-            start_time = time.time()
-            while time.time() - start_time < timeout:
-                try:
-                    order_info = self.get_async_order(id_number)
-                    if order_info and "id" in order_info and order_info["id"] is not None:
-                        if "profit" in order_info:
-                            status = "win" if order_info["profit"] > 0 else "lose"
-                            close_time = time.time()  # Timestamp cuando se confirma el resultado
-                            return order_info["profit"], status, close_time
-                except Exception as e:
-                    logger.debug(f"Error temporal obteniendo orden: {str(e)}")
-                    pass
-                
-                time.sleep(0.1)
-            
-            logger.error(f"Timeout verificando orden {id_number}")
-            return None, "timeout", None
-            
-        except Exception as e:
-            logger.error(f"Error verificando orden {id_number}: {str(e)}")
-            return None, "error", None
 
     def check_win(self, id_number: str, callback: Optional[Callable] = None) -> None:
         """
@@ -448,8 +471,8 @@ class PocketOption:
             callback: Función opcional que será llamada con el resultado
                      El callback recibirá un diccionario con:
                      - id: ID de la orden
-                     - profit: Ganancia/pérdida o None si hubo error
-                     - status: Estado de la orden ('win', 'lose', 'timeout', 'error')
+                     - status: Estado de la orden ('closed', 'pending', 'timeout', 'error')
+                     - deals: Datos completos de la orden del servidor (si está disponible)
                      - execution_time: Tiempo total de ejecución
         """
         self._pending_orders.put({
@@ -466,10 +489,35 @@ class PocketOption:
             id_number: ID de la orden
             
         Returns:
-            Optional[dict]: Resultado de la orden o None si no está disponible
+            Optional[dict]: Resultado de la orden con el formato del servidor o None si no está disponible
+            El formato es:
+            {
+                "deals": [{
+                    "id": str,
+                    "openTime": str,
+                    "closeTime": str,
+                    "openTimestamp": int,
+                    "closeTimestamp": int,
+                    "uid": int,
+                    "amount": float,
+                    "profit": float,
+                    "percentProfit": float,
+                    "percentLoss": float,
+                    "openPrice": float,
+                    "closePrice": float,
+                    "command": int,
+                    "asset": str,
+                    "isDemo": int,
+                    "currency": str,
+                    "amountUSD": float
+                }]
+            }
         """
-        return self._order_results.get(id_number)
-
+        result = self.api._order_results.get(id_number)
+        if result and "deals" in result and result["deals"]:
+            return result
+        return None
+    
     def __del__(self):
         """Limpieza al destruir la instancia."""
         # Señalizar al hilo worker que termine
@@ -832,7 +880,7 @@ class PocketOption:
                             current_candle_time = (current_server_time // period) * period
                             completed_candles = [
                                 candle for candle in normalized_buffer 
-                                if candle["time"] < current_candle_time
+                                if candle["time"] <= current_candle_time
                             ]
                             
                             if completed_candles:
@@ -896,10 +944,10 @@ class PocketOption:
                     logger.error("No se obtuvieron datos")
                     return None
             
-                # Asegurar que todas las velas tengan la clave "time"
-                for candle in all_data:
-                    if "timestamp" in candle and "time" not in candle:
-                        candle["time"] = candle.pop("timestamp")
+            # Asegurar que todas las velas tengan la clave "time"
+            for candle in all_data:
+                if "timestamp" in candle and "time" not in candle:
+                    candle["time"] = candle.pop("timestamp")
             
             # Ordenar por tiempo y eliminar duplicados
             all_data.sort(key=lambda x: x.get("time", 0))

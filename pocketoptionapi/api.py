@@ -123,6 +123,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
     historyNew = None
     server_timestamp = None
     sync_datetime = None
+    _order_results: Dict[str, dict] = {}
  
     
 
@@ -149,6 +150,7 @@ class PocketOptionAPI(object):  # pylint: disable=too-many-instance-attributes
         self.datafeed = DataFeed(self)
 
         self._history_data_event = threading.Event()
+        self._order_open_event = threading.Event()
 
     @property
     def websocket(self):
