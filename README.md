@@ -1,106 +1,153 @@
 # PocketOption API
 
-Una API no oficial para interactuar con PocketOption, implementada en Python.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
 
-## Instalación
+Una API no oficial para interactuar con PocketOption, implementada en Python con soporte para operaciones asíncronas.
+
+## ✨ Características
+
+- 🔒 Conexión WebSocket segura y estable
+- 🔄 Manejo automático de reconexiones
+- ⏰ Sincronización precisa del tiempo con el servidor
+- 💼 Soporte para cuentas demo y reales
+- ⚠️ Manejo robusto de errores
+- 📝 Logging detallado de operaciones
+- 📘 Tipado estático para mejor desarrollo
+
+## 🚀 Instalación
 
 ```bash
-pip install pocketoptionapi
+pip install -r requirements.txt
 ```
 
-## Inicio Rápido
+## 📖 Uso Básico
 
 ```python
+import asyncio
 from pocketoptionapi import PocketOption
 
-# Inicializar con SSID
-api = PocketOption(ssid="tu_ssid_aquí")
+async def main():
+    # Inicializar la API
+    api = PocketOption(ssid="TU_SSID_AQUÍ")
+    
+    # Conectar
+    await api.connect()
+    
+    # Verificar conexión
+    if api.check_connect():
+        print("Conectado exitosamente")
+        
+        # Obtener balance
+        balance = await api.get_balance()
+        print(f"Balance actual: {balance}")
+        
+        # Realizar una operación
+        result = await api.buy(
+            amount=100,
+            active="EURUSD",
+            direction="call",
+            duration=60
+        )
+        
+        if result:
+            print("Operación exitosa")
+    
+    # Cerrar conexión
+    await api.close()
 
-# Conectar
-api.start_async()
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
 
-## Funciones Principales
+## 🛠️ Funciones Principales
 
-### Autenticación y Conexión
-
-```python
-# Inicializar API
-api = PocketOption(ssid="tu_ssid_aquí")
-
-# Iniciar conexión asíncrona
-api.start_async()
-
-# Configurar sesión personalizada (opcional)
-api.set_session(
-    header={"User-Agent": "..."},
-    cookie={"cookie_name": "value"}
-)
-```
+### Autenticación
+| Función | Descripción |
+|---------|-------------|
+| `connect()` | Establece conexión con el servidor |
+| `check_connect()` | Verifica el estado de la conexión |
+| `close()` | Cierra la conexión |
 
 ### Trading
-
-```python
-# Realizar una operación
-amount = 1  # cantidad
-active = "EURUSD"  # activo
-direction = "call"  # dirección (call/put)
-duration = 60  # duración en segundos
-
-# Comprar opción
-api.buy(
-    amount=amount,
-    active=active,
-    direction=direction,
-    duration=duration
-)
-
-# Verificar resultado de una operación
-def process_result(result):
-    print(f"Resultado de la operación: {result}")
-
-api.check_win(order_id, callback=process_result)
-```
+| Función | Descripción |
+|---------|-------------|
+| `buy()` | Realiza una operación de compra |
+| `check_win()` | Verifica el resultado de una operación |
+| `get_balance()` | Obtiene el balance actual |
+| `get_candles()` | Obtiene datos históricos de velas |
 
 ### Datos de Mercado
+| Función | Descripción |
+|---------|-------------|
+| `get_asset_info()` | Obtiene información de un activo |
+| `get_all_assets()` | Lista todos los activos disponibles |
+| `get_open_trades()` | Obtiene operaciones abiertas |
+
+## 🔍 Manejo de Errores
 
 ```python
-# Obtener velas históricas
-candles = api.get_historical_candles(
-    active="EURUSD",
-    period=60,  # período en segundos
-    start_time=None,  # timestamp inicial (opcional)
-    count_request=1  # número de solicitudes
-)
+from pocketoptionapi.ws.client import WebSocketError, AuthenticationError, ConnectionError
 
-# Suscribirse a datos en tiempo real
-api.start_candles_stream(
-    active="EURUSD",
-    period=60,
-    buffer_size=1000
-)
+async def main():
+    try:
+        api = PocketOption(ssid="TU_SSID_AQUÍ")
+        await api.connect()
+    except AuthenticationError:
+        print("Error de autenticación: Verifica tu SSID")
+    except ConnectionError:
+        print("Error de conexión: Verifica tu conexión a internet")
+    except WebSocketError as e:
+        print(f"Error general del WebSocket: {e}")
+```
 
-# Obtener datos del stream
-stream_data = api.get_stream_data(
-    active="EURUSD",
-    period=60,
-    limit=100
+## 📝 Configuración del Logging
+
+```python
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename='pocketoption.log'
 )
 ```
 
-### Utilidades de Tiempo
+## 🎯 Eventos y Callbacks
 
 ```python
-# Obtener timestamp del servidor
-server_time = api.get_server_timestamp()
+async def on_balance_update(balance):
+    print(f"Nuevo balance: {balance}")
 
-# Obtener datetime del servidor
-server_datetime = api.get_server_datetime()
-
-# Obtener tiempo sincronizado
-sync_time = api.sync_timestamp()
-sync_datetime = api.sync_datetime()
+async def main():
+    api = PocketOption(ssid="TU_SSID_AQUÍ")
+    api.on_balance_update = on_balance_update
+    await api.connect()
 ```
+
+## 🔒 Consideraciones de Seguridad
+
+- 🚫 Nunca compartas tu SSID
+- 🔐 Usa variables de entorno para las credenciales
+- 🔄 Mantén actualizada la librería
+- 🛡️ Verifica los certificados SSL en producción
+
+## 🤝 Contribuciones
+
+Las contribuciones son bienvenidas. Por favor, asegúrate de:
+
+1. ✅ Seguir el estilo de código existente
+2. 🧪 Agregar tests para nuevas funcionalidades
+3. 📚 Actualizar la documentación
+4. ♻️ Mantener la compatibilidad hacia atrás
+
+## 📄 Licencia
+
+Este proyecto está bajo la Licencia MIT. Ver el archivo [LICENSE](LICENSE) para más detalles.
+
+## ⚠️ Descargo de Responsabilidad
+
+Esta es una API no oficial. Úsala bajo tu propio riesgo. No nos hacemos responsables por pérdidas financieras.
 
 ## Activos Disponibles
 
@@ -144,118 +191,3 @@ except Exception as e:
 ## Contribuir
 
 Las contribuciones son bienvenidas. Por favor, abre un issue o pull request en GitHub.
-
-## Licencia
-
-Este proyecto está licenciado bajo MIT License.
-
-## Características
-
-- Conexión WebSocket segura y estable
-- Manejo automático de reconexiones
-- Sincronización precisa del tiempo con el servidor
-- Soporte para cuentas demo y reales
-- Manejo robusto de errores
-- Logging detallado de operaciones
-- Tipado estático para mejor desarrollo
-
-## Uso Básico
-
-```python
-import asyncio
-from pocketoptionapi.api import PocketOptionApi
-
-async def main():
-    # Inicializar la API
-    api = PocketOptionApi(ssid="TU_SSID_AQUÍ")
-    
-    # Conectar
-    await api.connect()
-    
-    # Verificar conexión
-    if api.check_connect():
-        print("Conectado exitosamente")
-        
-        # Obtener balance
-        balance = await api.get_balance()
-        print(f"Balance actual: {balance}")
-        
-        # Realizar una operación
-        result = await api.buy(
-            price=100,
-            asset="EURUSD",
-            direction="call",
-            duration=60
-        )
-        
-        if result:
-            print("Operación exitosa")
-    
-    # Cerrar conexión
-    await api.close()
-
-if __name__ == "__main__":
-    asyncio.run(main())
-```
-
-## Manejo de Errores
-
-La API incluye manejo de errores específicos:
-
-```python
-from pocketoptionapi.ws.client import WebSocketError, AuthenticationError, ConnectionError
-
-async def main():
-    try:
-        api = PocketOptionApi(ssid="TU_SSID_AQUÍ")
-        await api.connect()
-    except AuthenticationError:
-        print("Error de autenticación: Verifica tu SSID")
-    except ConnectionError:
-        print("Error de conexión: Verifica tu conexión a internet")
-    except WebSocketError as e:
-        print(f"Error general del WebSocket: {e}")
-```
-
-## Configuración del Logging
-
-```python
-import logging
-
-# Configurar logging
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='pocketoption.log'
-)
-```
-
-## Eventos y Callbacks
-
-La API soporta eventos para manejar actualizaciones en tiempo real:
-
-```python
-async def on_balance_update(balance):
-    print(f"Nuevo balance: {balance}")
-
-async def main():
-    api = PocketOptionApi(ssid="TU_SSID_AQUÍ")
-    api.on_balance_update = on_balance_update
-    await api.connect()
-```
-
-## Consideraciones de Seguridad
-
-- Nunca compartas tu SSID
-- Usa variables de entorno para las credenciales
-- Mantén actualizada la librería
-- Verifica los certificados SSL en producción
-
-## Contribuciones
-
-Las contribuciones son bienvenidas. Por favor, asegúrate de:
-
-1. Seguir el estilo de código existente
-2. Agregar tests para nuevas funcionalidades
-3. Actualizar la documentación
-4. Mantener la compatibilidad hacia atrás
