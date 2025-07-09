@@ -188,6 +188,17 @@ except Exception as e:
 3. Implementa límites de tasa y manejo de errores apropiados en tu aplicación.
 4. Las operaciones de trading implican riesgo financiero.
 
+## Ejemplo de Bot con Machine Learning
+
+Se incluye un script de ejemplo `examples/ml_trading_bot.py` que muestra
+cómo entrenar un modelo sencillo de aprendizaje automático con datos
+históricos y ejecutar operaciones automáticas. El código utiliza un
+modelo de regresión logística y actualiza sus parámetros con cada vela
+nueva.
+
+> Este ejemplo es educativo y no garantiza ningún nivel de precisión ni
+> ganancias.
+
 ## Contribuir
 
 Las contribuciones son bienvenidas. Por favor, abre un issue o pull request en GitHub.
