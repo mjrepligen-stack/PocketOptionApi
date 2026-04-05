@@ -1,204 +1,222 @@
-# PocketOption API
+# PocketOption API (Python)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 
-Una API no oficial para interactuar con PocketOption, implementada en Python con soporte para operaciones asíncronas.
+Unofficial Python client for the PocketOption WebSocket API. **Version 2.0** exposes a synchronous high-level class, `PocketOption`, built on a single WebSocket layer (no separate data-feed module).
 
-## ✨ Características
+## Features
 
-- 🔒 Conexión WebSocket segura y estable
-- 🔄 Manejo automático de reconexiones
-- ⏰ Sincronización precisa del tiempo con el servidor
-- 💼 Soporte para cuentas demo y reales
-- ⚠️ Manejo robusto de errores
-- 📝 Logging detallado de operaciones
-- 📘 Tipado estático para mejor desarrollo
+- **Single WebSocket stack** — `WebsocketClient` handles Socket.IO frames and binary payloads (`451-[type, binary]`); `PocketOptionAPI` holds deques/buffers per asset; `PocketOption` is the stable entry point.
+- **Reliable session handling** — SSID parsing supports PHP-serialized `session` strings with embedded quotes; auth JSON is built with `json.dumps` for correct escaping.
+- **Auth handshake** — Payload includes `platform: 2`, `isFastHistory: true`, `isOptimized: true`. The client treats the connection as ready on **`successauth`** (not on earlier events such as `updateAssets`).
+- **Time synchronization** — Initial offset from the HTTP `Date` header on upgrade, refined with `updateStream` ticks; `TimeSynchronizer` exposes synced UTC and **server-native** time for history requests.
+- **Historical candles** — `loadHistoryPeriod` via `GetCandles`, optional **reconciliation** with `updateHistoryNewFast` and stream ticks (strip forming bar, replace stale bars, gap fill when tick coverage allows).
+- **Demo and live** — Parsed from the SSID (`isDemo` / `uid`).
+- **Dependencies** — `websockets>=12` (uses `extra_headers` on v12, `additional_headers` on v13+).
 
-## 🚀 Instalación
+## Architecture (v2.0)
+
+| Layer | Role |
+|--------|------|
+| `pocketoptionapi.ws.client.WebsocketClient` | Connect, auth, message routing, tick/history handlers. |
+| `pocketoptionapi.api.PocketOptionAPI` | Per-asset stream buffers, `updateHistoryNewFast` cache, history/order events. |
+| `pocketoptionapi.stable_api.PocketOption` | Public methods: connect, subscribe, `get_historical_candles`, `buy`, `check_win`, etc. |
+
+The old **`datafeed`** module was removed; all streaming logic lives in `ws/client.py`.
+
+## Requirements
+
+- Python **3.9+** recommended.
+- Install runtime deps:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 📖 Uso Básico
+Editable install from this repo:
+
+```bash
+pip install -e .
+```
+
+> **Note:** `examples/ml_trading_bot.py` uses `scikit-learn` and `numpy`, which are not listed in `requirements.txt`. Install them separately if you run that example.
+
+## Quick start
+
+The public API is **synchronous**: `connect()` runs the WebSocket on a background thread. Use `check_connect()` and `is_time_synced()` before requesting candles.
 
 ```python
-import asyncio
+import logging
+import time
 from pocketoptionapi import PocketOption
 
-async def main():
-    # Inicializar la API
-    api = PocketOption(ssid="TU_SSID_AQUÍ")
-    
-    # Conectar
-    await api.connect()
-    
-    # Verificar conexión
-    if api.check_connect():
-        print("Conectado exitosamente")
-        
-        # Obtener balance
-        balance = await api.get_balance()
-        print(f"Balance actual: {balance}")
-        
-        # Realizar una operación
-        result = await api.buy(
-            amount=100,
-            active="EURUSD",
-            direction="call",
-            duration=60
-        )
-        
-        if result:
-            print("Operación exitosa")
-    
-    # Cerrar conexión
-    await api.close()
+logging.basicConfig(level=logging.INFO)
 
-if __name__ == "__main__":
-    asyncio.run(main())
+SSID = r'''42["auth",{...}]'''  # Your captured Socket.IO auth string
+
+api = PocketOption(SSID)
+ok, err = api.connect()
+if not ok:
+    raise RuntimeError(err)
+
+# Wait until socket is up and time sync is ready (required for history)
+while not (api.check_connect() and api.is_time_synced()):
+    time.sleep(0.1)
+
+api.subscribe("EURUSD_otc", period=60)
+time.sleep(1)
+
+candles = api.get_historical_candles(
+    "EURUSD_otc",
+    period=60,
+    offset=45000,  # Large offset avoids server timeouts on loadHistoryPeriod
+    count_request=1,
+)
+if candles:
+    print(len(candles), "bars")
 ```
 
-## 🛠️ Funciones Principales
+See `test.py` for a minimal end-to-end script (balance, assets, payout, sentiment, ticks).
 
-### Autenticación
-| Función | Descripción |
-|---------|-------------|
-| `connect()` | Establece conexión con el servidor |
-| `check_connect()` | Verifica el estado de la conexión |
-| `close()` | Cierra la conexión |
+## SSID format
+
+Pass the full wire string you would send after `42`, e.g.:
+
+`42["auth",{"session":"...","isDemo":1,"uid":123456,"platform":2,...}]`
+
+The client extracts `session`, `isDemo`, and `uid`, then builds a fresh auth message with the fields the server expects. Real-mode sessions may be long PHP-serialized strings; do not truncate or manually escape quotes—`json.dumps` handles them.
+
+## Connection and time sync
+
+1. Call `connect()` → returns `(True, None)` or `(False, reason)`.
+2. Poll until `check_connect()` and `is_time_synced()` are true. **`get_historical_candles` returns `None` if time is not synced.**
+3. For candle-aligned logic, use `get_server_datetime()` / `get_server_timestamp()` (synced UTC-based estimates).
+
+## Main API (`PocketOption`)
+
+### Connection
+
+| Method | Description |
+|--------|-------------|
+| `connect()` | Start WebSocket thread; wait up to ~30s for connection. Returns `(success: bool, error: str \| None)`. |
+| `check_connect()` | Whether `global_value.websocket_is_connected` is true. |
+| `is_time_synced()` | Whether `TimeSynchronizer` has references and offset (needed for history). |
+
+### Time
+
+| Method | Description |
+|--------|-------------|
+| `get_server_timestamp()` | Unix seconds (synced). |
+| `get_server_datetime()` | Timezone-aware `datetime` (local zone via `tzlocal`). |
+
+### Account and market info
+
+| Method | Description |
+|--------|-------------|
+| `get_balance()` | Last balance if `balance_updated`, else `None`. |
+| `get_assets()` | Dict keyed by symbol → `id`, `name`, `category`, `payout`, `is_available`, `timeframes`, `raw`. |
+| `get_payout(asset)` | Payout % or `None`. |
+| `get_sentiment(asset)` | Sentiment from `chafor` cache or `None`. |
+| `get_open_deals()` / `get_closed_deals()` / `get_pending_deals()` | Shallow copies of server-fed lists. |
+
+### Real-time data
+
+| Method | Description |
+|--------|-------------|
+| `subscribe(asset, period=60)` | `changeSymbol` + `subfor` for `updateStream` / `updateHistoryNewFast`. |
+| `get_realtime_ticks(asset=None, limit=100)` | Recent `(timestamp, price)` from the in-memory ring buffer. |
+
+### Historical OHLC
+
+| Method | Description |
+|--------|-------------|
+| `get_historical_candles(active, period, start_time=None, offset=None, count_request=1)` | Loads via `loadHistoryPeriod`; merges/reconciles with fast history and stream ticks. |
+
+**`offset`:** Sent to the server as the `offset` field (candle window / count). **`None` sends null.** In practice, use a **large positive value** (e.g. `45000` or `9000`) so requests do not time out.
+
+**`count_request`:** Multiple paginated rounds; after each response, the end time steps backward from the oldest candle.
+
+After fetch, `_reconcile_with_realtime` may:
+
+- Remove the **forming** candle.
+- **Replace** recent server bars with tick-built OHLC when bars look non-finalized and tick coverage is above ~70%.
+- **Fill gaps** using ticks when possible.
+
+### Data helpers
+
+| Method | Description |
+|--------|-------------|
+| `process_candles_data(data, period)` | Build a **pandas** `DataFrame` with local wall-clock `time` string and numeric `timestamp`. |
+| `process_candle(candle_data, period)` | Sort, dedupe, forward-fill; returns `(df, is_continuous)`. |
 
 ### Trading
-| Función | Descripción |
-|---------|-------------|
-| `buy()` | Realiza una operación de compra |
-| `check_win()` | Verifica el resultado de una operación |
-| `get_balance()` | Obtiene el balance actual |
-| `get_candles()` | Obtiene datos históricos de velas |
 
-### Datos de Mercado
-| Función | Descripción |
-|---------|-------------|
-| `get_asset_info()` | Obtiene información de un activo |
-| `get_all_assets()` | Lista todos los activos disponibles |
-| `get_open_trades()` | Obtiene operaciones abiertas |
+| Method | Description |
+|--------|-------------|
+| `buy(amount, active, direction, expiration)` | Sends `openOrder` (via `Buyv3`). `direction` is sent as `action` (e.g. `call` / `put`). `expiration` is duration in **seconds**. Returns `(order_dict, True)` on matching `requestId`, else `({}, False)`. |
+| `check_win(id_number, callback=None)` | Queues resolution against `successcloseOrder` / `_order_results`; optional callback with deal dict. |
+| `get_order_result(id_number)` | Snapshot of cached result if `deals` present. |
 
-## 🔍 Manejo de Errores
+There is **no** high-level `close()` on `PocketOption`; the socket runs until the process exits or the thread ends. Lower-level `PocketOptionAPI.websocket` exposes async `close` if you extend the client.
 
-```python
-from pocketoptionapi.ws.client import WebSocketError, AuthenticationError, ConnectionError
+## Error types
 
-async def main():
-    try:
-        api = PocketOption(ssid="TU_SSID_AQUÍ")
-        await api.connect()
-    except AuthenticationError:
-        print("Error de autenticación: Verifica tu SSID")
-    except ConnectionError:
-        print("Error de conexión: Verifica tu conexión a internet")
-    except WebSocketError as e:
-        print(f"Error general del WebSocket: {e}")
-```
+Defined in `pocketoptionapi.ws.client`:
 
-## 📝 Configuración del Logging
+- `WebSocketError`
+- `AuthenticationError`
+- `ConnectionError`
+- `MessageError`
+
+Connection failures are also surfaced via `connect()`’s second return value and `global_value.websocket_error_reason`.
+
+## Logging
 
 ```python
 import logging
 
 logging.basicConfig(
     level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    filename='pocketoption.log'
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 ```
 
-## 🎯 Eventos y Callbacks
+## Candle periods
 
-```python
-async def on_balance_update(balance):
-    print(f"Nuevo balance: {balance}")
+Supported bar sizes (seconds) include:
 
-async def main():
-    api = PocketOption(ssid="TU_SSID_AQUÍ")
-    api.on_balance_update = on_balance_update
-    await api.connect()
-```
+`1, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 43200, 86400, 604800, 2592000`
 
-## 🔒 Consideraciones de Seguridad
+(see `PocketOption.CANDLE_SIZES`.)
 
-- 🚫 Nunca compartas tu SSID
-- 🔐 Usa variables de entorno para las credenciales
-- 🔄 Mantén actualizada la librería
-- 🛡️ Verifica los certificados SSL en producción
+## Assets
 
-## 🤝 Contribuciones
+Forex, crypto, indices, commodities, and stock symbols depend on PocketOption’s catalog. Inspect `get_assets()` or `pocketoptionapi.constants` for IDs and names.
 
-Las contribuciones son bienvenidas. Por favor, asegúrate de:
+## Examples
 
-1. ✅ Seguir el estilo de código existente
-2. 🧪 Agregar tests para nuevas funcionalidades
-3. 📚 Actualizar la documentación
-4. ♻️ Mantener la compatibilidad hacia atrás
+| File | Description |
+|------|-------------|
+| `test.py` | Connection, balance, assets, subscribe, sentiment, ticks. |
+| `examples/ml_trading_bot.py` | Fetch candles, train a small classifier, loop (educational only). |
+| `examples/real-time-data+chart.py` | Real-time chart demo. |
+| `examples/buy+check.py` | Order placement pattern. |
 
-## 📄 Licencia
+## Security
 
-Este proyecto está bajo la Licencia MIT. Ver el archivo [LICENSE](LICENSE) para más detalles.
+- Do not commit or share live SSIDs or session strings.
+- Prefer environment variables or secret stores for credentials in real apps.
+- This library disables TLS verification on the bundled `requests` session in `PocketOptionAPI` (`session.verify = False`) for compatibility with some environments—harden this for production if you rely on HTTP helpers.
 
-## ⚠️ Descargo de Responsabilidad
+## Disclaimer
 
-Esta es una API no oficial. Úsala bajo tu propio riesgo. No nos hacemos responsables por pérdidas financieras.
+This is an **unofficial** API. It is not affiliated with PocketOption. Trading involves risk; the authors are not responsible for financial losses. Examples are for education and testing only.
 
-## Activos Disponibles
+## Contributing
 
-La API soporta una amplia gama de activos, incluyendo:
+Contributions are welcome. Please keep code style consistent, add tests when possible, and update this README when public behavior changes.
 
-- Forex: EURUSD, GBPUSD, USDJPY, etc.
-- Criptomonedas: BTCUSD, ETHUSD, etc.
-- Índices: SP500, NASUSD, etc.
-- Materias primas: XAUUSD (Oro), XAGUSD (Plata), etc.
-- Acciones: AAPL, GOOGL, etc.
+## License
 
-Para ver la lista completa de activos y sus IDs, consulta `pocketoptionapi.constants.ACTIVES`.
-
-## Períodos Disponibles
-
-Los siguientes períodos (en segundos) están disponibles para las velas:
-
-- 1s, 5s, 10s, 15s, 30s
-- 1m (60s), 2m, 5m, 10m, 15m
-- 30m, 1h, 2h, 4h, 8h, 12h
-- 1d, 1w, 1M
-
-## Manejo de Errores
-
-La API incluye manejo de errores robusto:
-
-```python
-try:
-    result = api.buy(amount=1, active="EURUSD", direction="call", duration=60)
-except Exception as e:
-    print(f"Error en la operación: {e}")
-```
-
-## Notas Importantes
-
-1. Esta es una API no oficial y no está asociada con PocketOption.
-2. Asegúrate de manejar adecuadamente las credenciales y no compartir tu SSID.
-3. Implementa límites de tasa y manejo de errores apropiados en tu aplicación.
-4. Las operaciones de trading implican riesgo financiero.
-
-## Ejemplo de Bot con Machine Learning
-
-Se incluye un script de ejemplo `examples/ml_trading_bot.py` que muestra
-cómo entrenar un modelo sencillo de aprendizaje automático con datos
-históricos y ejecutar operaciones automáticas. El código utiliza un
-modelo de regresión logística y actualiza sus parámetros con cada vela
-nueva.
-
-> Este ejemplo es educativo y no garantiza ningún nivel de precisión ni
-> ganancias.
-
-## Contribuir
-
-Las contribuciones son bienvenidas. Por favor, abre un issue o pull request en GitHub.
+MIT License.
