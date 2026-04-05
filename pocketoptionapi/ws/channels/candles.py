@@ -1,45 +1,37 @@
-"""Module for Pocket option candles websocket chanel."""
+"""Module for Pocket Option candles websocket channel."""
 import logging
+import time
 
 from pocketoptionapi.ws.channels.base import Base
-import time
-import random
+
+logger = logging.getLogger(__name__)
 
 
-def index_num():
-    # El número mínimo sería 100000000000 (12 dígitos)
-    minimo = 5000
-    # El número máximo sería 999999999999 (12 dígitos)
-    maximo = 10000 - 1
-    # Generar y retornar un número aleatorio dentro del rango
-    return random.randint(minimo, maximo)
+def _make_index() -> int:
+    """Generates a unique request index matching the web client format."""
+    return int(time.time() * 100)
 
 
 class GetCandles(Base):
-    """Class for Pocket option candles websocket chanel."""
-    # pylint: disable=too-few-public-methods
-
-    name = "sendMessage"
+    name = "getCandles"
 
     def __call__(self, active_id, interval, count, end_time):
-        """Method to send message to candles websocket chanel.
+        """Request historical candles.
 
-        :param active_id: The active/asset identifier.
-        :param interval: The candle duration (timeframe for the candles).
-        :param count: The number of candles you want to have
+        :param active_id: Asset symbol (e.g. "EURUSD_otc").
+        :param interval: Candle period in seconds.
+        :param count: Offset / number of candles.
+        :param end_time: Unix timestamp for the end of the range.
         """
-
-        #      {"asset": "AUDNZD_otc", "index": 171201484810, "time": 1712002800, "offset": 9000, "period": 60}]
         data = {
             "asset": str(active_id),
-            "index": end_time,
-            "offset": count,  # number of candles
+            "index": _make_index(),
+            "offset": count,
             "period": interval,
-            "time": end_time,  # time size sample:if interval set 1 mean get time 0~1 candle
+            "time": end_time,
         }
 
         data = ["loadHistoryPeriod", data]
-
-        logging.debug(f"GetCandles > {data}")
+        logger.info(f"GetCandles > {data}")
 
         self.send_websocket_request(self.name, data)

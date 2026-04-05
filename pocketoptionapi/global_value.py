@@ -1,10 +1,10 @@
-# python
+# Minimal global state — only values that MUST be shared across threads.
+# Per-instance state (assets, deals, streams) lives in PocketOptionAPI.
+
 websocket_is_connected = False
-# try fix ssl.SSLEOFError: EOF occurred in violation of protocol (_ssl.c:2361)
-ssl_Mutual_exclusion = False  # mutex read write
-# if false websocket can sent self.websocket.send(data)
-# else can not sent self.websocket.send(data)
-ssl_Mutual_exclusion_write = False  # if thread write
+
+ssl_Mutual_exclusion = False
+ssl_Mutual_exclusion_write = False
 
 SSID = None
 
@@ -15,6 +15,7 @@ balance_id = None
 balance = None
 balance_type = None
 balance_updated = None
+
 result = None
 order_data = {}
 account_id = None

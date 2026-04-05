@@ -1,106 +1,56 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from collections import deque
+from email.utils import parsedate_to_datetime
 import websockets
 from websockets.exceptions import WebSocketException
 import json
 import logging
 import ssl
 import time
+import re
 import pocketoptionapi.global_value as global_value
 from pocketoptionapi.constants import REGION
 from pocketoptionapi.ws.objects.time_sync import TimeSynchronizer
 from typing import Optional, Dict, Any, List
 import backoff
-import re  # Agregar al inicio del archivo con los otros imports
 
-# Configuración mejorada del logging
 logger = logging.getLogger(__name__)
 
-# Evitar duplicación de handlers
-# if not logger.handlers:
-#     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-#     handler = logging.StreamHandler()
-#     handler.setFormatter(formatter)
-#     logger.addHandler(handler)
-    
-# # Establecer nivel de logging solo si no está configurado
-# if logger.level == 0:  # 0 es el nivel NOTSET
-#     logger.setLevel(logging.INFO)
+_WS_VERSION = tuple(int(x) for x in websockets.__version__.split(".")[:2])
+_HEADERS_KWARG = "additional_headers" if _WS_VERSION >= (13,) else "extra_headers"
+
 
 class WebSocketError(Exception):
-    """Clase base para errores de WebSocket."""
     pass
 
 class AuthenticationError(WebSocketError):
-    """Error durante la autenticación."""
     pass
 
 class ConnectionError(WebSocketError):
-    """Error de conexión."""
     pass
 
 class MessageError(WebSocketError):
-    """Error en el procesamiento de mensajes."""
     pass
 
-async def process_message(message: str) -> None:
-    """
-    Procesa los mensajes recibidos del WebSocket.
-    
-    Args:
-        message: El mensaje a procesar
-    
-    Raises:
-        MessageError: Si hay un error procesando el mensaje
-    """
-    try:
-        data = json.loads(message)
-        logger.debug(f"Mensaje recibido: {data}")
-
-        if isinstance(data, dict) and 'uid' in data:
-            logger.debug(f"UID procesado: {data['uid']}")
-        elif isinstance(data, list) and len(data) > 0:
-            event_type = data[0]
-            event_data = data[1] if len(data) > 1 else None
-            logger.debug(f"Tipo de evento: {event_type}")
-
-    except json.JSONDecodeError as e:
-        raise MessageError(f"Error decodificando JSON: {e}")
-    except Exception as e:
-        raise MessageError(f"Error procesando mensaje: {e}")
 
 class WebsocketClient:
     def __init__(self, api) -> None:
-        """
-        Inicializa el cliente WebSocket.
-
-        Args:
-            api: Instancia de la clase PocketOptionApi
-
-        Nota:
-            El SSID debe proporcionarse como una raw string (r"") para mantener los caracteres
-            de escape. Por ejemplo:
-            ssid = r'42["auth",{"session":"...","isDemo":0}]'
-        """
         self.api = api
         self._initialize_state()
         self._parse_ssid()
-        
+
         self.region = REGION()
         self.url: Optional[str] = None
-        #self.loop = asyncio.get_event_loop()
         self.connected = global_value.websocket_is_connected
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
-        self.base_delay = 1  # Delay base para reconexión exponencial
-        
-        # Eventos para esperar respuestas
+        self.base_delay = 1
+
         self._order_event = asyncio.Event()
-        self.orders_data = {}  # Almacena información de órdenes
+        self.orders_data = {}
 
     def _initialize_state(self) -> None:
-        """Inicializa las variables de estado."""
         self.wait_second_message = False
         self.successCloseOrder = False
         self.history_data_ready = False
@@ -110,239 +60,212 @@ class WebsocketClient:
         self.message = None
         self.ssid = global_value.SSID
         self.websocket = None
+        self._post_auth_done = False
 
     def _parse_ssid(self) -> None:
-        """
-        Parsea el SSID para extraer isDemo y session usando expresiones regulares.
+        """Parses uid, isDemo, and the full session from the raw SSID string.
+
+        The session value often contains internal double-quotes (PHP serialized
+        format like ``a:4:{s:10:"session_id";...}hash``).  A simple
+        ``[^"]+`` regex truncates it at the first internal quote.  Instead we
+        use a greedy pattern anchored to ``"isDemo"`` which only appears once.
         """
         try:
-            # Buscar isDemo y session directamente
-            is_demo_match = re.search(r'"isDemo":(\d+)', self.ssid)
-            session_match = re.search(r'"session":"([^"]+)"', self.ssid)
-            
-            if not is_demo_match or not session_match:
-                raise ValueError("No se encontró isDemo o session en el SSID")
-                
-            self.is_demo = bool(int(is_demo_match.group(1)))
-            self.session = session_match.group(1)
-            
-            logger.debug(f"Cuenta tipo: {'DEMO' if self.is_demo else 'REAL'}")
-            
+            ssid_str = self.ssid or ""
+
+            is_demo_match = re.search(r'"isDemo"\s*:\s*(\d+)', ssid_str)
+            uid_match = re.search(r'"uid"\s*:\s*(\d+)', ssid_str)
+
+            self.is_demo = bool(int(is_demo_match.group(1))) if is_demo_match else True
+            self.uid = int(uid_match.group(1)) if uid_match else None
+
+            session_match = re.search(r'"session"\s*:\s*"(.*)",\s*"isDemo"', ssid_str)
+            self.session = session_match.group(1) if session_match else ""
+
+            logger.info(
+                "SSID parsed: %s mode, uid=%s, session_len=%d",
+                "DEMO" if self.is_demo else "REAL",
+                self.uid,
+                len(self.session),
+            )
+
         except Exception as e:
-            logger.warning(f"Error parseando SSID, usando modo demo por defecto: {e}")
+            logger.warning(f"Error parsing SSID, defaulting to demo: {e}")
             self.is_demo = True
+            self.uid = None
+            self.session = ""
+
+    def _build_auth_message(self) -> str:
+        """Builds the auth message with properly JSON-escaped session value.
+
+        ``json.dumps`` handles escaping internal double-quotes in the PHP
+        session string so the server receives valid JSON.
+        """
+        auth_payload = {
+            "session": self.session,
+            "isDemo": 1 if self.is_demo else 0,
+            "uid": self.uid,
+            "platform": 2,
+            "isFastHistory": True,
+            "isOptimized": True,
+        }
+        return f'42{json.dumps(["auth", auth_payload])}'
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
 
     @backoff.on_exception(
         backoff.expo,
         (WebSocketException, ConnectionError),
         max_tries=5,
-        max_time=30
+        max_time=30,
     )
     async def websocket_listener(self, ws):
-        """
-        Escucha mensajes del WebSocket con reconexión exponencial.
-        
-        Args:
-            ws: Conexión WebSocket
-        """
         try:
             async for message in ws:
                 await self.on_message(message)
         except Exception as e:
-            logger.error(f"Error en websocket_listener: {e}")
+            logger.error(f"websocket_listener error: {e}")
             global_value.websocket_is_connected = False
             raise
 
     async def send_ping(self, ws):
-        """
-        Envía pings periódicos para mantener la conexión viva.
-        
-        Args:
-            ws: Conexión WebSocket
-        """
         ping_interval = 20
         last_ping_time = time.time()
-        
+
         while True:
             try:
                 current_time = time.time()
                 if current_time - last_ping_time >= ping_interval:
                     if not global_value.websocket_is_connected:
-                        logger.warning("Conexión perdida, deteniendo ping")
                         break
-                        
                     try:
                         await ws.send('42["ps"]')
                         last_ping_time = current_time
-                        logger.debug("Ping enviado exitosamente")
                     except Exception as e:
-                        logger.error(f"Error enviando ping: {e}")
+                        logger.error(f"Ping error: {e}")
                         global_value.websocket_is_connected = False
                         break
-                        
                 await asyncio.sleep(1)
-                
             except Exception as e:
-                logger.error(f"Error en ciclo de ping: {e}")
+                logger.error(f"Ping loop error: {e}")
                 global_value.websocket_is_connected = False
                 break
 
-    async def wait_for_successauth(self, ws):
-        try:
-            start_time = time.time()
-            while time.time() - start_time < 2:  # 2 segundos de timeout
-                if global_value.websocket_is_connected:
-                    return True
-                await asyncio.sleep(0.1)
-            return False
-        except Exception as e:
-            logger.error(f"Error en autenticación: {e}")
-            return False
-
     async def connect(self):
-        """
-        Establece la conexión WebSocket con reconexión exponencial.
-        """
         ssl_context = ssl.create_default_context()
         ssl_context.check_hostname = False
         ssl_context.verify_mode = ssl.CERT_NONE
 
         try:
             await self.api.close("TRY CLOSE CONNECTION")
-        except Exception as e:
-            logger.debug(f"Error cerrando conexión previa: {e}")
+        except Exception:
+            pass
 
         available_servers = self._filter_servers()
         if not available_servers:
-            raise ConnectionError("No hay servidores disponibles para el tipo de cuenta")
+            raise ConnectionError("No servers available for this account type")
 
         while not global_value.websocket_is_connected and self.reconnect_attempts < self.max_reconnect_attempts:
             for url in available_servers:
                 if global_value.websocket_is_connected:
                     break
-
                 try:
-                    delay = min(self.base_delay * (2 ** self.reconnect_attempts), 10)
-                    logger.info(f"Intento de conexión {self.reconnect_attempts + 1} a: {url} ({'REAL' if not self.is_demo else 'DEMO'})")
-                    
+                    self.delay = min(self.base_delay * (2 ** self.reconnect_attempts), 10)
+                    logger.info(f"Connection attempt {self.reconnect_attempts + 1} to: {url} ({'REAL' if not self.is_demo else 'DEMO'})")
+
+                    ws_kwargs = {
+                        _HEADERS_KWARG: self._get_headers(),
+                        "open_timeout": 30,
+                        "ping_interval": None,
+                        "ping_timeout": None,
+                        "close_timeout": 5,
+                        "max_size": 1_000_000,
+                        "compression": None,
+                    }
                     async with websockets.connect(
-                        url,
-                        ssl=ssl_context,
-                        extra_headers=self._get_headers(),
-                        timeout=30,
-                        ping_interval=None,  # Deshabilitamos el ping automático
-                        ping_timeout=None,
-                        close_timeout=5,
-                        max_size=1000000,
-                        compression=None
+                        url, ssl=ssl_context, **ws_kwargs,
                     ) as ws:
                         self.websocket = ws
                         self.url = url
+                        self._post_auth_done = False
+
+                        self._sync_time_from_http_date(ws)
 
                         try:
-                            # Esperar mensaje inicial
-                            message = await ws.recv()
-                            if not message.startswith('0{"sid":'):
-                                raise ValueError("Mensaje inicial inválido")
-                            
-                            # Enviar mensaje 40
-                            await ws.send('40')
-                            
-                            # Esperar respuesta con nuevo sid
-                            message = await ws.recv()
-                            if not message.startswith('40{"sid":'):
-                                raise ValueError("Segundo mensaje inválido")
-                            
-                            # Enviar autenticación
-                            logger.debug(f"Enviando SSID: {self.ssid}")
-                            await ws.send(self.ssid)
-                            
-                            # Esperar respuesta de autenticación
-                            message = await ws.recv()
-                            if message == '41':
-                                logger.error("Error de autenticación: Servidor rechazó las credenciales")
-                                break
-                            
-                            # Iniciar tareas de escucha y ping
                             tasks = [
                                 self.websocket_listener(ws),
-                                self.send_ping(ws)
+                                self.send_ping(ws),
                             ]
-                            
-                            try:
-                                done, pending = await asyncio.wait(
-                                    tasks,
-                                    return_when=asyncio.FIRST_COMPLETED
-                                )
-                                
-                                for task in pending:
-                                    task.cancel()
-                                    try:
-                                        await task
-                                    except asyncio.CancelledError:
-                                        pass
-                                    
-                                for task in done:
-                                    exc = task.exception()
-                                    if exc:
-                                        logger.error(f"Error en tarea: {exc}")
-                                        raise exc
-                            
-                            except Exception as e:
-                                logger.error(f"Error en las tareas: {e}")
-                                continue
-                                
-                        except asyncio.TimeoutError:
-                            logger.warning(f"Timeout en handshake con {url}")
-                            continue
+                            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                            for task in pending:
+                                task.cancel()
+                                try:
+                                    await task
+                                except asyncio.CancelledError:
+                                    pass
+                            for task in done:
+                                exc = task.exception()
+                                if exc:
+                                    raise exc
                         except Exception as e:
-                            logger.error(f"Error en el handshake inicial: {e}")
+                            logger.error(f"WebSocket tasks error: {e}")
                             continue
 
                 except Exception as e:
-                    logger.warning(f"Error de conexión: {e}")
+                    logger.warning(f"Connection error: {e}")
                     self.reconnect_attempts += 1
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(self.delay)
                     continue
 
             if not global_value.websocket_is_connected:
-                logger.warning(f"No se pudo conectar a ningún servidor, reintentando en {delay} segundos...")
-                await asyncio.sleep(delay)
+                logger.warning(f"Could not connect to any server, retrying in {self.delay}s...")
+                await asyncio.sleep(self.delay)
 
         if self.reconnect_attempts >= self.max_reconnect_attempts:
-            raise ConnectionError("Se alcanzó el máximo número de intentos de reconexión")
+            raise ConnectionError("Max reconnection attempts reached")
 
     def _filter_servers(self) -> List[str]:
-        """
-        Filtra los servidores disponibles según el tipo de cuenta.
-        Prioriza los servidores más estables.
-        
-        Returns:
-            Lista de URLs de servidores filtrados
-        """
-        available_servers = []
-        preferred_servers = []
-        
+        preferred, fallback = [], []
         for url in self.region.get_regions(True):
             if self.is_demo:
-                if "demo-api" in url.lower():  # Priorizar servidores demo-api
-                    preferred_servers.append(url)
+                if "demo-api" in url.lower():
+                    preferred.append(url)
                 elif "demo" in url.lower() or "try" in url.lower():
-                    available_servers.append(url)
+                    fallback.append(url)
             elif not self.is_demo and "demo" not in url.lower() and "try" not in url.lower():
-                if "api" in url.lower():  # Priorizar servidores api principales
-                    preferred_servers.append(url)
+                if "api" in url.lower():
+                    preferred.append(url)
                 else:
-                    available_servers.append(url)
-                    
-        # Retornar primero los servidores preferidos
-        return preferred_servers + available_servers
+                    fallback.append(url)
+        return preferred + fallback
+
+    def _sync_time_from_http_date(self, ws) -> None:
+        """Extracts the Date header from the WS upgrade response for initial time sync."""
+        try:
+            headers = getattr(ws, 'response_headers', None)
+            if headers is None:
+                resp = getattr(ws, 'response', None)
+                if resp is not None:
+                    headers = getattr(resp, 'headers', None)
+            if headers is None:
+                logger.debug("No response headers available for initial time sync")
+                return
+
+            date_str = headers.get('Date')
+            if not date_str:
+                logger.debug("No Date header in WS upgrade response")
+                return
+
+            server_dt = parsedate_to_datetime(date_str)
+            server_ts = server_dt.timestamp()
+            self.api.time_sync.synchronize(server_ts)
+            logger.info(f"Initial time sync from HTTP Date header: {date_str} -> {server_ts:.0f}")
+        except Exception as e:
+            logger.warning(f"Could not sync time from HTTP Date header: {e}")
 
     def _get_headers(self) -> Dict[str, str]:
-        """
-        Obtiene los headers para la conexión WebSocket.
-        Headers capturados de una conexión real exitosa.
-        """
         return {
             "Pragma": "no-cache",
             "Cache-Control": "no-cache",
@@ -350,543 +273,288 @@ class WebsocketClient:
             "Origin": "https://pocketoption.com",
             "Accept-Encoding": "gzip, deflate, br, zstd",
             "Accept-Language": "es-ES,es;q=0.9",
-            "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits"
+            "Sec-WebSocket-Extensions": "permessage-deflate; client_max_window_bits",
         }
 
-    async def send_message(self, message: str) -> None:
-        """
-        Envía un mensaje a través del WebSocket.
-        
-        Args:
-            message: Mensaje a enviar
-            
-        Raises:
-            ConnectionError: Si no hay conexión activa
-        """
-        if not global_value.websocket_is_connected:
-            raise ConnectionError("No hay conexión WebSocket activa")
+    # ------------------------------------------------------------------
+    # Messaging
+    # ------------------------------------------------------------------
 
+    async def send_message(self, message: str) -> None:
+        if not global_value.websocket_is_connected or self.websocket is None:
+            raise ConnectionError("No active WebSocket connection")
         if message is not None:
             self.message = message
             try:
                 await self.websocket.send(message)
-                logger.debug(f"send_message > Mensaje enviado: {message}")
+                logger.debug(f"Sent: {message[:200]}")
             except Exception as e:
-                logger.error(f"send_message > Error enviando mensaje: {e}")
-                raise ConnectionError(f"send_message > Error enviando mensaje: {e}")
+                logger.error(f"Send error: {e}")
+                raise ConnectionError(f"Send error: {e}")
 
-    async def on_message(self, message: str) -> None:
-        """
-        Procesa los mensajes recibidos del WebSocket.
-        
-        Args:
-            message: Mensaje recibido
-        """
+    async def send_subfor(self, asset: str) -> None:
+        """Sends the subfor subscription message for a given asset."""
+        msg = f'42{json.dumps(["subfor", asset])}'
+        await self.send_message(msg)
+        logger.debug(f"subfor sent for {asset}")
+
+    async def on_message(self, message) -> None:
         if isinstance(message, bytes):
-            message = message.decode('utf-8')
             try:
-                message_data = json.loads(message)
-                # await self._handle_binary_message(message_data)
-            except json.JSONDecodeError:
-                logger.warning(f"on_message > Error decodificando mensaje binario: {message}")
+                message = message.decode("utf-8")
+                json.loads(message)
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                logger.debug(f"Undecodable binary message ({len(message)} bytes)")
             return
 
         await self._handle_text_message(message)
 
-    # async def _handle_binary_message(self, message_data: Dict[str, Any]) -> None:
-    #     """
-    #     Procesa mensajes binarios decodificados.
-        
-    #     Args:
-    #         message_data: Datos del mensaje decodificado
-    #     """
-    #     if "time" in message_data:
-    #         await self._handle_time_sync(message_data)
-    #     elif "balance" in message_data:
-    #         await self._handle_balance_update(message_data)
-    #     elif "requestId" in message_data and message_data["requestId"] == 'buy':
-    #         await self._handle_order_data(message_data)
-    #     elif self.history_data_ready and "data" in message_data:
-    #         await self._handle_history_data(message_data)
-    #     elif self.updateStream and isinstance(message_data, list):
-    #         await self._handle_stream_update(message_data)
-
-
-    async def on_error(self, error):  # pylint: disable=unused-argument
+    async def on_error(self, error):
         logger.error(error)
         global_value.websocket_error_reason = str(error)
         global_value.check_websocket_if_error = True
 
-    async def on_close(self, error):  # pylint: disable=unused-argument
-        logger.debug(error)
-        # logger.warning(f"Websocket connection closed. Reason: {error}")
+    async def on_close(self, error):
+        logger.debug(f"WebSocket closed: {error}")
         global_value.websocket_is_connected = False
 
-    async def _handle_balance_update(self, data: Dict[str, Any]) -> None:
-        """
-        Maneja las actualizaciones de balance.
-        
-        Args:
-            data: Datos de balance
-        """
-        if "uid" in data:
-            global_value.balance_id = data["uid"]
-        global_value.balance = data["balance"]
-        global_value.balance_type = data["isDemo"]
-        logger.debug(f"Balance actualizado: {data}")
-
-    async def _handle_order_data(self, data: Dict[str, Any]) -> None:
-        """
-        Maneja los datos de órdenes.
-        
-        Args:
-            data: Datos de la orden
-        """
-        global_value.order_data = data
-        logger.debug(f"Orden recibida: {data}")
-
-    async def _handle_history_data(self, data: Dict[str, Any]) -> None:
-        """
-        Maneja los datos históricos.
-        
-        Args:
-            data: Datos históricos
-        """
-        self.history_data_ready = False
-        if "data" in data:
-            self.api.history_data = data["data"]
-            logger.info(f"Datos históricos recibidos: {data}")
-            if hasattr(self.api, '_history_data_event'):
-                self.api._history_data_event.set()
-        else:
-            logger.warning("Mensaje de datos históricos no tiene el campo 'data'")
-
-    # async def _handle_stream_update(self, data: List[Any]) -> None:
-    #     """
-    #     Maneja las actualizaciones del stream.
-        
-    #     Args:
-    #         data: Datos del stream
-    #     """
-    #     self.updateStream = False
-    #     if len(data) > 0 and isinstance(data[0], list):
-    #         stream_data = data[0]
-    #         if len(stream_data) >= 3:
-    #             asset, timestamp, price = stream_data
-    #             logger.debug(f"Datos del stream: asset={asset}, timestamp={timestamp}, price={price}")
-                
-                
-                
-    #             if hasattr(self.api, 'current_asset') and asset == self.api.current_asset:
-    #                 self.api.current_price = price
-                    
-    #                 logger.debug(f"Datos actualizados para {asset}: price={price}, timestamp={timestamp}")
+    # ------------------------------------------------------------------
+    # Text message routing (Engine.IO / Socket.IO handshake + events)
+    # ------------------------------------------------------------------
 
     async def _handle_text_message(self, message: str) -> None:
-        """
-        Procesa mensajes de texto del WebSocket.
-        
-        Args:
-            message: Mensaje de texto a procesar
-        """
+        ws = self.websocket
+        if ws is None:
+            return
         if message.startswith('0{"sid":'):
-            logger.debug("Recibido SID inicial")
-            await self.websocket.send("40")
+            logger.debug("Handshake: open packet, sending 40")
+            await ws.send("40")
         elif message == "2":
-            await self.websocket.send("3")
+            await ws.send("3")
         elif message.startswith('40{"sid":'):
-            logger.debug("Recibido segundo SID, enviando autenticación")
-            await self.websocket.send(self.ssid)
-        elif message.startswith('451-['):
+            logger.debug("Handshake: namespace connected, sending auth")
+            auth_msg = self._build_auth_message()
+            logger.info(f"Sending auth: {auth_msg[:120]}...")
+            await ws.send(auth_msg)
+        elif message == "41":
+            logger.error("Handshake: namespace disconnect (41) — credentials rejected")
+            global_value.websocket_is_connected = False
+            await ws.close()
+        elif message.startswith("451-["):
             await self._handle_451_message(message)
         elif message.startswith("42") and "NotAuthorized" in message:
             await self._handle_unauthorized()
 
-    async def _decode_binary_message(self, binary_data: bytes, msg_type: str) -> Any:
-        """
-        Decodifica y procesa mensajes binarios según su tipo.
-        
-        Args:
-            binary_data: Datos binarios a decodificar
-            msg_type: Tipo de mensaje (ej: updateStream, updateAssets, etc)
-            
-        Returns:
-            Datos decodificados y procesados
-        """
-        try:
-            decoded_data = binary_data.decode('utf-8')
-            data = json.loads(decoded_data)
-            
-            logger.debug(f"Mensaje binario decodificado ({msg_type}): {json.dumps(data)}")
-
-            
-            
-            if msg_type == "successopenOrder":
-                if isinstance(data, dict):
-                    # Almacenar datos de la orden
-                    order_id = data.get("id")
-                    if order_id:
-                        self.orders_data[order_id] = data
-                        logger.debug(f"Orden registrada: {order_id}")
-                        
-                    # Actualizar variables globales para compatibilidad
-                    global_value.order_data = data
-                    global_value.result = True
-                    
-                    # Notificar que tenemos respuesta
-                    self.api._order_open_event.set()
-                    
-                    logger.debug(f"successopenOrder > Orden procesada: {json.dumps(data, indent=4)}")
-                else:
-                    logger.warning(f"successopenOrder > Datos no válidos: {data}")
-                    global_value.result = False
-                    self.api._order_open_event.set()
-                return data
-            
-            elif msg_type == "successauth":
-                logger.debug(f"successauth > Autenticación exitosa: {data}")
-                try:
-                    global_value.account_id = data.get("accountId")
-                    await self.on_open()
-                    await self._send_post_auth_messages()
-                except Exception as e:
-                    logger.error(f"msg_type: {msg_type} => Error enviando mensajes: {e}")
-                return data
-
-            elif msg_type == "updateStream":
-                if isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
-                    stream_data = data[0]
-                    if len(stream_data) >= 3:
-                        asset, timestamp, price = stream_data
-                        self.api.updateStream = True
-                        # Sincronizar tiempo
-                        self.api.time_sync.synchronize(timestamp)
-                        
-                        # Crear estructura de datos del stream
-                        stream_update = {
-                            "asset": asset,
-                            "timestamp": timestamp,
-                            "price": price
-                        }
-                        
-                        # Enviar datos al API
-                        await self.api.process_stream_update(stream_update)
-                        
-                        logger.debug(f"updateStream > Stream update: {stream_data}")
-                        return stream_data
-                    
-            elif msg_type == "loadHistoryPeriod":
-                if isinstance(data, dict):
-                    self.api._history_data_event.set()
-                    self.api.history_data = data
-                    logger.debug(f"loadHistoryPeriod > Recibido: {data}")
-                    return data
-                else:
-                    logger.warning(f"loadHistoryPeriod > Datos no válidos: {data}")
-                    return None
-                
-            elif msg_type == "successcloseOrder":
-                logger.debug(f"successcloseOrder > Orden cerrada exitosamente: {json.dumps(data, indent=4)}")
-                if isinstance(data, dict) and "deals" in data and isinstance(data["deals"], list):
-                    # Almacenar los datos en el formato correcto
-                    for deal in data["deals"]:
-                        if "id" in deal:
-                            deal_id = deal["id"]
-                            # Almacenar los datos en el formato especificado
-                            self.api._order_results[deal_id] = {
-                                "deals": [deal]  # Mantener la estructura exacta
-                            }
-                            logger.debug(f"successcloseOrder > Orden registrada: {deal_id}")
-                return data
-                    
-
-            elif msg_type == "updateAssets":
-                if isinstance(data, list):
-                    assets_info = []
-                    for asset_data in data:
-                        if isinstance(asset_data, list) and len(asset_data) >= 2:
-                            asset_info = {
-                                "id": asset_data[0],
-                                "symbol": asset_data[1],
-                                "data": asset_data[2:] if len(asset_data) > 2 else []
-                            }
-                            assets_info.append(asset_info)
-                            logger.debug(f"updateAssets > Assets actualizados: {asset_info}")
-                    logger.debug(f"updateAssets > Assets actualizados: {len(assets_info)} activos")
-                    return assets_info
-                    
-            elif msg_type == "successupdateBalance":
-                if isinstance(data, dict):
-                    await self._handle_balance_update(data)
-                    logger.debug(f"successupdateBalance > Balance actualizado: {data.get('balance')} (Demo: {data.get('isDemo') if data.get('isDemo') else 'Real'})")
-                    return data
-                    
-            elif msg_type == "updateHistoryNew":
-                try:
-                    # Marcar que estamos recibiendo datos históricos
-                    stream_key = f"stream_{data.get('asset', '')}"
-                    setattr(self.api, stream_key, True)
-                    logger.debug(f"Marcador de stream establecido: {stream_key}")
-                    
-                    if isinstance(data, dict) and "asset" in data:
-                        logger.debug(f"updateHistoryNew > Recibidos datos para {data['asset']} con período {data.get('period')}")
-                        
-                        processed_candle = {
-                            "asset": data["asset"],
-                            "period": data.get("period"),
-                            "candles": []
-                        }
-                        
-                        # Procesar velas primero
-                        if "candles" in data:
-                            logger.debug(f"updateHistoryNew > Procesando {len(data['candles'])} velas")
-                            for candle in data["candles"]:
-                                if isinstance(candle, list) and len(candle) >= 5:
-                                    processed_candle["candles"].append({
-                                        "timestamp": candle[0],
-                                        "open": candle[1],
-                                        "close": candle[2],
-                                        "high": candle[3],
-                                        "low": candle[4]
-                                    })
-                                    logger.debug(f"Vela procesada: timestamp={datetime.fromtimestamp(candle[0])} "
-                                               f"O={candle[1]} C={candle[2]} H={candle[3]} L={candle[4]}")
-
-                            # Enviar las velas procesadas al datafeed
-                            if processed_candle["candles"]:
-                                # Verificar orden de timestamps
-                                timestamps = [c["timestamp"] for c in processed_candle["candles"]]
-                                is_ordered = all(timestamps[i] <= timestamps[i+1] for i in range(len(timestamps)-1))
-                                logger.debug(f"Velas ordenadas por tiempo: {is_ordered}")
-                                
-                                await self.api.process_candle_update(
-                                    processed_candle["asset"],
-                                    processed_candle["period"],
-                                    processed_candle["candles"]
-                                )
-                                logger.debug(f"updateHistoryNew > Enviadas {len(processed_candle['candles'])} velas al datafeed")
-                        
-                        # Luego procesar ticks del historial
-                        if "history" in data:
-                            logger.debug(f"updateHistoryNew > Procesando {len(data['history'])} ticks históricos")
-                            ticks_processed = 0
-                            last_timestamp = None
-                            
-                            for tick in data["history"]:
-                                if isinstance(tick, list) and len(tick) >= 2:
-                                    current_timestamp = tick[0]
-                                    if last_timestamp and current_timestamp < last_timestamp:
-                                        logger.warning(f"Tick fuera de orden: actual={current_timestamp} último={last_timestamp}")
-                                    
-                                    processed_tick = {
-                                        "asset": data["asset"],
-                                        "timestamp": current_timestamp,
-                                        "price": tick[1]
-                                    }
-                                    await self.api.process_stream_update(processed_tick)
-                                    ticks_processed += 1
-                                    last_timestamp = current_timestamp
-                                    self.api.time_sync.synchronize(current_timestamp)
-                                    
-                                    if ticks_processed % 100 == 0:
-                                        logger.debug(f"Procesados {ticks_processed} ticks")
-
-                            logger.debug(f"updateHistoryNew > Procesados {ticks_processed} ticks históricos")
-
-                        logger.debug(f"updateHistoryNew > Historial procesado para {processed_candle['asset']}: {len(processed_candle['candles'])} velas")
-                        return processed_candle
-                    else:
-                        logger.warning(f"updateHistoryNew > Datos no válidos o sin asset: {data}")
-                except Exception as e:
-                    logger.error(f"Error procesando updateHistoryNew: {e}")
-
-            else:
-                logger.info(f"_decode_binary_message > Mensaje binario no manejado: {msg_type}")
-            
-            return data
-            
-        except json.JSONDecodeError as e:
-            logger.error(f"_decode_binary_message > Error decodificando mensaje binario: {e}")
-            logger.debug(f"Datos binarios raw: {binary_data}")
-            return None
-        except Exception as e:
-            logger.error(f"_decode_binary_message > Error procesando mensaje binario: {e}")
-            return None
+    # ------------------------------------------------------------------
+    # 451 binary-event handler
+    # ------------------------------------------------------------------
 
     async def _handle_451_message(self, message: str) -> None:
-        """
-        Maneja los mensajes que comienzan con 451.
-        Formato: 451-["tipo",{"_placeholder":true,"num":0}]
-        
-        Args:
-            message: Mensaje 451 a procesar
-        """
+        """Handles Socket.IO binary events: 451-["type", {_placeholder, num}]"""
         try:
             json_part = message.split("-", 1)[1]
             msg_data = json.loads(json_part)
             msg_type = msg_data[0]
-            logger.debug(f"_handle_451_message > Tipo de mensaje 451: {msg_type}")
-            
-            # Esperar mensaje binario si hay placeholder
+            logger.debug(f"451 message type: {msg_type}")
+
+            ws = self.websocket
+            if ws is None:
+                return
             if len(msg_data) > 1 and isinstance(msg_data[1], dict) and msg_data[1].get("_placeholder"):
                 try:
-                    binary_data = await asyncio.wait_for(self.websocket.recv(), timeout=5)
+                    binary_data = await asyncio.wait_for(ws.recv(), timeout=5)
                     if isinstance(binary_data, bytes):
-                        logger.debug(f"_handle_451_message > Recibido mensaje binario para {msg_type}")
-                        decoded_data = await self._decode_binary_message(binary_data, msg_type)
-                        
-                        # Procesar datos decodificados según tipo
-                        handlers = {
-                           # "successauth": self._handle_auth_success,
-                            "updateAssets": self._handle_assets_update,
-                            "successupdateBalance": self._handle_balance_success,
-                           # "successopenOrder": self._handle_open_order_success,
-                            "updateClosedDeals": self._handle_closed_deals,
-                           # "successcloseOrder": self._handle_close_order_success,
-                           # "loadHistoryPeriod": self._handle_history_period,
-                            "updateStream": self._handle_stream_success,
-                            "updateHistoryNew": self._handle_history_new
-                        }
-
-                        if msg_type in handlers:
-                            await handlers[msg_type](decoded_data)
-                        else:
-                            #logger.warning(f"Tipo de mensaje 451 no manejado: {msg_type}")
-                            pass
-                            
+                        await self._decode_binary_message(binary_data, msg_type)
                 except asyncio.TimeoutError:
-                    logger.warning(f"_handle_451_message > Timeout esperando datos binarios para {msg_type}")
-                    return
+                    logger.warning(f"Timeout waiting for binary data: {msg_type}")
                 except Exception as e:
-                    logger.error(f"_handle_451_message > Error recibiendo datos binarios: {e}")
-                    return
+                    logger.error(f"Error receiving binary data for {msg_type}: {e}")
 
         except Exception as e:
-            logger.error(f"_handle_451_message > Error procesando mensaje 451: {e}")
+            logger.error(f"Error processing 451 message: {e}")
 
-    async def _handle_assets_update(self, msg_data: List[Any]) -> None:
-        """
-        Maneja la actualización de activos.
-        
-        Args:
-            msg_data: Datos del mensaje
-        """
-        logger.debug("_handle_assets_update > Recibida actualización de activos")
-        # Aquí puedes procesar los datos binarios de activos si es necesario
+    async def _decode_binary_message(self, binary_data: bytes, msg_type: str) -> Any:
+        """Decodes and dispatches binary message payloads by type."""
+        try:
+            decoded = binary_data.decode("utf-8")
+            data = json.loads(decoded)
+            logger.debug(f"Binary decoded ({msg_type}): {str(data)[:200]}")
 
-    async def _handle_auth_success(self, msg_data: List[Any]) -> None:
+            if msg_type == "successauth":
+                logger.info("Authentication successful")
+                if isinstance(data, dict):
+                    global_value.account_id = data.get("id") or data.get("accountId")
+                await self._mark_connected_and_post_auth()
+                return data
+
+            elif msg_type == "updateAssets":
+                await self._handle_assets_update(data)
+                return data
+
+            elif msg_type == "successupdateBalance":
+                if isinstance(data, dict):
+                    await self._handle_balance_update(data)
+                return data
+
+            elif msg_type == "updateStream":
+                if isinstance(data, list) and data and isinstance(data[0], list):
+                    stream_data = data[0]
+                    if len(stream_data) >= 3:
+                        asset, timestamp, price = stream_data[0], stream_data[1], stream_data[2]
+                        self.api.time_sync.synchronize(timestamp)
+                        self.api._on_stream_tick(asset, timestamp, price)
+                return data
+
+            elif msg_type == "loadHistoryPeriodFast":
+                if isinstance(data, dict):
+                    self.api.history_data = data
+                    self.api._history_data_event.set()
+                    logger.debug(f"loadHistoryPeriodFast received: {len(data.get('data', []))} candles")
+                return data
+
+            elif msg_type == "updateHistoryNewFast":
+                if isinstance(data, dict) and "asset" in data:
+                    self.api._on_history_new_fast(data)
+                return data
+
+            elif msg_type == "successopenOrder":
+                if isinstance(data, dict):
+                    order_id = data.get("id")
+                    if order_id:
+                        self.orders_data[order_id] = data
+                    global_value.order_data = data
+                    global_value.result = True
+                    self.api._order_open_event.set()
+                    logger.debug(f"Order opened: {data.get('id')}")
+                else:
+                    global_value.result = False
+                    self.api._order_open_event.set()
+                return data
+
+            elif msg_type == "successcloseOrder":
+                if isinstance(data, dict) and "deals" in data and isinstance(data["deals"], list):
+                    for deal in data["deals"]:
+                        if "id" in deal:
+                            self.api._order_results[deal["id"]] = {"deals": [deal]}
+                return data
+
+            elif msg_type == "updateOpenedDeals":
+                if isinstance(data, list):
+                    self.api._opened_deals = data
+                    logger.debug(f"Open deals updated: {len(data)} deals")
+                return data
+
+            elif msg_type == "updateClosedDeals":
+                if isinstance(data, list):
+                    self.api._closed_deals = data
+                    logger.debug(f"Closed deals updated: {len(data)} deals")
+                return data
+
+            elif msg_type == "successupdatePending":
+                if isinstance(data, list):
+                    self.api._pending_deals = data
+                return data
+
+            elif msg_type == "chafor":
+                if isinstance(data, list):
+                    for item in data:
+                        if isinstance(item, list) and len(item) >= 2:
+                            self.api._sentiment[item[0]] = item[1]
+                return data
+
+            elif msg_type == "updateCharts":
+                self.api._charts_data = data
+                return data
+
+            else:
+                logger.debug(f"Unhandled binary message type: {msg_type}")
+
+            return data
+
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error for {msg_type}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error processing binary {msg_type}: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_assets_update(self, data) -> None:
+        """Parses the updateAssets payload into a structured catalog.
+
+        NOTE: Does NOT mark the connection as authenticated — only
+        ``successauth`` is authoritative for that. In real-mode servers the
+        assets catalog can arrive *before* auth is confirmed.
         """
-        Maneja la autenticación exitosa.
-        
-        Args:
-            msg_data: Datos del mensaje
-        """
-        logger.info("_handle_auth_success > Autenticación exitosa")
+        logger.debug("Assets update received")
+        if isinstance(data, list):
+            catalog = {}
+            for asset_row in data:
+                if isinstance(asset_row, list) and len(asset_row) >= 6:
+                    asset_id = asset_row[0]
+                    symbol = asset_row[1]
+                    name = asset_row[2] if len(asset_row) > 2 else symbol
+                    category = asset_row[3] if len(asset_row) > 3 else "unknown"
+                    payout = asset_row[5] if len(asset_row) > 5 else 0
+                    is_available = asset_row[14] if len(asset_row) > 14 else False
+                    timeframes = asset_row[15] if len(asset_row) > 15 else []
+
+                    catalog[symbol] = {
+                        "id": asset_id,
+                        "name": name,
+                        "category": category,
+                        "payout": payout,
+                        "is_available": is_available,
+                        "timeframes": timeframes,
+                        "raw": asset_row,
+                    }
+            self.api._assets_catalog = catalog
+            logger.info(f"Assets catalog loaded: {len(catalog)} assets")
+
+    async def _handle_balance_update(self, data: Dict[str, Any]) -> None:
+        if "uid" in data:
+            global_value.balance_id = data["uid"]
+        if "balance" in data:
+            global_value.balance = data["balance"]
+        if "isDemo" in data:
+            global_value.balance_type = data["isDemo"]
+        global_value.balance_updated = True
+        logger.debug(f"Balance updated: {data.get('balance')}")
+
+    async def _handle_unauthorized(self) -> None:
+        logger.error("Unauthorized: please use a valid SSID")
+        global_value.ssl_Mutual_exclusion = False
+        global_value.websocket_is_connected = False
+        if self.websocket is not None:
+            await self.websocket.close()
+
+    async def on_open(self) -> None:
+        if global_value.websocket_is_connected:
+            return
+        logger.info(f"Authenticated & connected to: {self.url}")
+        global_value.websocket_is_connected = True
+
+    async def _mark_connected_and_post_auth(self) -> None:
         await self.on_open()
-        await self._send_post_auth_messages()
+        if self._post_auth_done:
+            return
+        self._post_auth_done = True
+        try:
+            await self._send_post_auth_messages()
+        except Exception as e:
+            logger.error(f"Post-auth messages error: {e}")
 
     async def _send_post_auth_messages(self) -> None:
-        """Envía mensajes necesarios después de la autenticación."""
+        ws = self.websocket
+        if ws is None:
+            return
         messages = [
             '42["indicator/load"]',
             '42["favorite/load"]',
             '42["price-alert/load"]',
-            '42["changeSymbol", {"asset": "AUDCAD_otc", "period": 60}]'
         ]
         for msg in messages:
-            await self.websocket.send(msg)
-
-    async def _handle_balance_success(self, _: List[Any]) -> None:
-        """Maneja la actualización exitosa del balance."""
-        global_value.balance_updated = True
-        logger.debug("_handle_balance_success > Balance actualizado exitosamente")
-
-    async def _handle_open_order_success(self, data):
-        """
-        Maneja la respuesta exitosa de una orden abierta.
-        
-        Args:
-            data: Diccionario con la información de la orden
-            {
-                "id": str,                # ID único de la orden
-                "openTime": str,          # Hora de apertura
-                "closeTime": str,         # Hora de cierre esperada
-                "openTimestamp": int,     # Timestamp de apertura
-                "closeTimestamp": int,    # Timestamp de cierre esperado
-                "uid": int,               # ID del usuario
-                "isDemo": int,            # Si es cuenta demo
-                "amount": float,          # Monto de la orden
-                "profit": float,          # Beneficio esperado
-                "percentProfit": float,   # Porcentaje de beneficio
-                "percentLoss": float,     # Porcentaje de pérdida
-                "openPrice": float,       # Precio de apertura
-                "asset": str,             # Activo
-                "command": int,           # Tipo de orden (0=call, 1=put)
-                "currency": str           # Moneda
-            }
-        """
-        try:
-            if isinstance(data, dict):
-                # Validar campos requeridos
-                required_fields = ["id", "openPrice", "amount", "asset", "command"]
-                if all(field in data for field in required_fields):
-                    # Actualizar variables globales
-                    global_value.order_data = data
-                    global_value.result = True
-                    
-                    # Registrar detalles de la orden
-                    direction = "call" if data["command"] == 0 else "put"
-                    logger.info(f"Orden abierta exitosamente:")
-                    logger.info(f"ID: {data['id']}")
-                    logger.info(f"Activo: {data['asset']}")
-                    logger.info(f"Dirección: {direction}")
-                    logger.info(f"Monto: {data['amount']} {data.get('currency', 'USD')}")
-                    logger.info(f"Precio de apertura: {data['openPrice']}")
-                else:
-                    logger.error("Respuesta de orden incompleta")
-                    global_value.result = False
-            else:
-                logger.error("Formato de respuesta inválido")
-                global_value.result = False
-                
-        except Exception as e:
-            logger.error(f"Error procesando orden: {str(e)}")
-            global_value.result = False
-
-    async def _handle_closed_deals(self, _: List[Any]) -> None:
-        """Maneja las operaciones cerradas."""
-        self._updateClosedDeals = True
-        self.wait_second_message = True
-        logger.debug("_handle_closed_deals > Enviando cambio de símbolo para sincronización")
-
-    async def _handle_close_order_success(self, _: List[Any]) -> None:
-        """Maneja el cierre exitoso de una orden."""
-        self.successCloseOrder = True
-        self.wait_second_message = True
-        logger.debug("_handle_close_order_success > Orden cerrada exitosamente")
-
-    async def _handle_history_period(self, _: List[Any]) -> None:
-        """Maneja la carga del período histórico."""
-        self.history_data_ready = True
-
-    async def _handle_stream_success(self, _: List[Any]) -> None:
-        """Maneja la actualización exitosa del stream."""
-        self.updateStream = True
-        logger.debug("_handle_stream_success > Stream actualizado")
-
-    async def _handle_history_new(self, _: List[Any]) -> None:
-        """Maneja la actualización del nuevo historial."""
-        self.updateHistoryNew = True
-        logger.debug("_handle_history_new > Nuevo historial disponible")
-
-    async def _handle_unauthorized(self) -> None:
-        """Maneja el caso de usuario no autorizado."""
-        logger.error("Usuario no autorizado: Por favor, use un SSID válido")
-        global_value.ssl_Mutual_exclusion = False
-        global_value.websocket_is_connected = False
-        await self.websocket.close()
-
-    async def on_open(self) -> None:
-        """Procesa la apertura del WebSocket."""
-        logger.info(f"Conectado a: {self.url}")
-        global_value.websocket_is_connected = True
+            await ws.send(msg)

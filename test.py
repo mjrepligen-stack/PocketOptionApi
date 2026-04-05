@@ -1,57 +1,56 @@
 import logging
-import pandas as pd
 import time
-from pocketoptionapi.stable_api import PocketOption
 import json
+from pocketoptionapi.stable_api import PocketOption
 
+logging.basicConfig(level=logging.INFO, datefmt="%Y-%m-%d %H:%M:%S")
 
-logging.basicConfig(level=logging.INFO, datefmt='%Y-%m-%d %H:%M:%S')
-pd.set_option('display.float_format', lambda x: '%.5f' % x)
 
 def process_order_result(result):
-    """Callback para procesar el resultado de la orden"""
-
-    logging.info(f"Resultado de la orden: {json.dumps(result, indent=4)}")
-            
+    logging.info(f"Order result: {json.dumps(result, indent=4)}")
     return result
 
+
 def main():
-    try:
-        # Conectar API
-        ssid = r"""42["auth",{"session":"YOUR_SESSION","isDemo":1,"uid":0,"platform":2}]"""
-        api = PocketOption(ssid)
-        api.connect()
-        
-        # Esperar conexión
-        while not (api.check_connect() and api.is_time_synced()):
-            continue
-            
-        # Configuración
-        asset = "AUDCAD_otc"
-        
-        while True:
-            try:
-                server_time = api.get_server_datetime()
-                if server_time.second == 0:
-                    order_data, order_status = api.buy(amount=1, active=asset, direction="call", expiration=10)
+    ssid = r"""42["auth",{"session":"YOUR_SESSION","isDemo":1,"uid":0,"platform":2}]"""
+    api = PocketOption(ssid)
+    ok, err = api.connect()
 
-                    if order_status:
-                        # Iniciar la verificación asíncrona con callback
-                        api.check_win(order_data.get("id"), callback=process_order_result)
+    if not ok:
+        logging.error(f"Connection failed: {err}")
+        return
 
-                print(server_time.strftime("%Y-%m-%d %H:%M:%S"))
+    while not (api.check_connect() and api.is_time_synced()):
+        time.sleep(0.1)
 
-            except Exception as e:
-                logging.error(f"Error: {e}")
-            
+    logging.info(f"Connected. Balance: {api.get_balance()}")
+    logging.info(f"Assets loaded: {len(api.get_assets())}")
+
+    asset = "EURUSD_otc"
+    payout = api.get_payout(asset)
+    logging.info(f"Payout for {asset}: {payout}%")
+
+    api.subscribe(asset, 60)
+    time.sleep(2)
+
+    sentiment = api.get_sentiment(asset)
+    logging.info(f"Sentiment for {asset}: {sentiment}%")
+
+    ticks = api.get_realtime_ticks(asset, limit=5)
+    logging.info(f"Recent ticks: {ticks}")
+
+    while True:
+        try:
+            server_time = api.get_server_datetime()
+            print(server_time.strftime("%Y-%m-%d %H:%M:%S"))
             time.sleep(1)
-        
-    except Exception as e:
-        logging.error(f"Error principal: {e}")
-        
-    except KeyboardInterrupt:
-        logging.info("Interrupción del usuario")
-            
+        except KeyboardInterrupt:
+            logging.info("User interrupted")
+            break
+        except Exception as e:
+            logging.error(f"Error: {e}")
+            time.sleep(1)
+
+
 if __name__ == "__main__":
     main()
-
