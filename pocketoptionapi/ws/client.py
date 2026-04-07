@@ -69,6 +69,12 @@ class WebsocketClient:
         format like ``a:4:{s:10:"session_id";...}hash``).  A simple
         ``[^"]+`` regex truncates it at the first internal quote.  Instead we
         use a greedy pattern anchored to ``"isDemo"`` which only appears once.
+
+        The session value captured by the regex still carries JSON escape
+        sequences (``\\"`` for an embedded double-quote) because it was
+        extracted from inside a JSON string literal.  We JSON-decode it so
+        that ``_build_auth_message`` → ``json.dumps`` only applies one layer
+        of escaping — matching what the browser originally sent.
         """
         try:
             ssid_str = self.ssid or ""
@@ -80,7 +86,16 @@ class WebsocketClient:
             self.uid = int(uid_match.group(1)) if uid_match else None
 
             session_match = re.search(r'"session"\s*:\s*"(.*)",\s*"isDemo"', ssid_str)
-            self.session = session_match.group(1) if session_match else ""
+            session_raw = session_match.group(1) if session_match else ""
+
+            # JSON-decode the captured session to strip one layer of escaping.
+            # e.g. captured \" (backslash+quote) → actual " character.
+            # json.dumps in _build_auth_message will then re-encode it correctly.
+            try:
+                self.session = json.loads('"' + session_raw + '"')
+            except (json.JSONDecodeError, ValueError):
+                # Fallback for sessions without JSON escapes (simple demo tokens).
+                self.session = session_raw
 
             logger.info(
                 "SSID parsed: %s mode, uid=%s, session_len=%d",
@@ -167,9 +182,21 @@ class WebsocketClient:
         if not available_servers:
             raise ConnectionError("No servers available for this account type")
 
-        while not global_value.websocket_is_connected and self.reconnect_attempts < self.max_reconnect_attempts:
+        # For real accounts: probe latencies in parallel and sort fastest-first
+        # (this is the automatic zone/region detection — no need to hard-code regions).
+        # For demo: order is already deterministic (primary EU first), no probe needed.
+        if not self.is_demo and len(available_servers) > 1:
+            available_servers = await self._sort_servers_by_latency(available_servers, ssl_context)
+
+        while (
+            not global_value.websocket_is_connected
+            and not global_value.check_websocket_if_error   # stop immediately on auth failure
+            and self.reconnect_attempts < self.max_reconnect_attempts
+        ):
             for url in available_servers:
                 if global_value.websocket_is_connected:
+                    break
+                if global_value.check_websocket_if_error:   # auth rejected — no point trying more
                     break
                 try:
                     self.delay = min(self.base_delay * (2 ** self.reconnect_attempts), 10)
@@ -177,7 +204,7 @@ class WebsocketClient:
 
                     ws_kwargs = {
                         _HEADERS_KWARG: self._get_headers(),
-                        "open_timeout": 30,
+                        "open_timeout": 8,   # reduced from 30s — fast fail on unreachable servers
                         "ping_interval": None,
                         "ping_timeout": None,
                         "close_timeout": 5,
@@ -219,7 +246,10 @@ class WebsocketClient:
                     await asyncio.sleep(self.delay)
                     continue
 
-            if not global_value.websocket_is_connected:
+            if (
+                not global_value.websocket_is_connected
+                and not global_value.check_websocket_if_error
+            ):
                 logger.warning(f"Could not connect to any server, retrying in {self.delay}s...")
                 await asyncio.sleep(self.delay)
 
@@ -227,19 +257,69 @@ class WebsocketClient:
             raise ConnectionError("Max reconnection attempts reached")
 
     def _filter_servers(self) -> List[str]:
-        preferred, fallback = [], []
-        for url in self.region.get_regions(True):
-            if self.is_demo:
-                if "demo-api" in url.lower():
-                    preferred.append(url)
-                elif "demo" in url.lower() or "try" in url.lower():
-                    fallback.append(url)
-            elif not self.is_demo and "demo" not in url.lower() and "try" not in url.lower():
-                if "api" in url.lower():
-                    preferred.append(url)
-                else:
-                    fallback.append(url)
-        return preferred + fallback
+        """Return the ordered candidate server list for the current SSID type.
+
+        Demo  → EU servers only, deterministic order (primary first).
+        Real  → all real servers in base order; connect() will sort by latency.
+        """
+        if self.is_demo:
+            return self.region.get_demo_servers(randomize=False)
+        return self.region.get_real_servers(randomize=False)
+
+    async def _sort_servers_by_latency(
+        self,
+        servers: List[str],
+        ssl_context: ssl.SSLContext,
+        probe_timeout: float = 1.5,
+    ) -> List[str]:
+        """Probe all servers in parallel via TCP and sort fastest-first.
+
+        Unreachable servers are appended at the end of the list so they are
+        still tried as a last resort rather than silently dropped.
+        """
+        from urllib.parse import urlparse
+
+        async def _probe(url: str) -> tuple:
+            parsed = urlparse(url)
+            host = parsed.hostname or ""
+            port = parsed.port or 443
+            t0 = time.monotonic()
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port, ssl=ssl_context),
+                    timeout=probe_timeout,
+                )
+                latency = time.monotonic() - t0
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                except Exception:
+                    pass
+                return latency, url
+            except Exception:
+                return float("inf"), url
+
+        results = await asyncio.gather(*[_probe(u) for u in servers])
+        results = sorted(results, key=lambda x: x[0])
+
+        reachable = [(lat, url) for lat, url in results if lat != float("inf")]
+        unreachable = [(lat, url) for lat, url in results if lat == float("inf")]
+
+        if reachable:
+            logger.info(
+                "Server latency probe: %s",
+                ", ".join(
+                    f"{url.split('/')[2]} ({lat * 1000:.0f}ms)"
+                    for lat, url in reachable
+                ),
+            )
+        if unreachable:
+            logger.debug(
+                "Unreachable servers (will try last): %s",
+                ", ".join(url.split("/")[2] for _, url in unreachable),
+            )
+
+        return [url for _, url in reachable] + [url for _, url in unreachable]
 
     def _sync_time_from_http_date(self, ws) -> None:
         """Extracts the Date header from the WS upgrade response for initial time sync."""
@@ -339,6 +419,8 @@ class WebsocketClient:
         elif message == "41":
             logger.error("Handshake: namespace disconnect (41) — credentials rejected")
             global_value.websocket_is_connected = False
+            global_value.check_websocket_if_error = True
+            global_value.websocket_error_reason = "Unauthorized: credentials rejected by server (namespace disconnect 41)"
             await ws.close()
         elif message.startswith("451-["):
             await self._handle_451_message(message)
@@ -528,6 +610,8 @@ class WebsocketClient:
         logger.error("Unauthorized: please use a valid SSID")
         global_value.ssl_Mutual_exclusion = False
         global_value.websocket_is_connected = False
+        global_value.check_websocket_if_error = True
+        global_value.websocket_error_reason = "Unauthorized: please use a valid SSID"
         if self.websocket is not None:
             await self.websocket.close()
 
