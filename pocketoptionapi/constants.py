@@ -136,16 +136,23 @@ ACTIVES = {
 
 
 class REGION:
+    # Demo: EU-only infrastructure. Primary server first, fallback second.
+    # Order is intentionally deterministic — no random shuffle for demo.
     DEMO_SERVERS = {
-        "DEMO": "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket",
-        "DEMO_2": "wss://try-demo-eu.po.market/socket.io/?EIO=4&transport=websocket",
+        "DEMO_EU":   "wss://demo-api-eu.po.market/socket.io/?EIO=4&transport=websocket",
+        "DEMO_EU_2": "wss://try-demo-eu.po.market/socket.io/?EIO=4&transport=websocket",
     }
-    
+
+    # Real: EU + US servers.  Latency probe at connect time will auto-select
+    # the nearest zone — no need to hard-code a preferred region.
+    # Servers are listed EU-first so the probe order is geographically diverse.
     REAL_SERVERS = {
-        "UNITED_STATES": "wss://api-us-north.po.market/socket.io/?EIO=4&transport=websocket",
-        "UNITED_STATES2": "wss://api-us2.po.market/socket.io/?EIO=4&transport=websocket",
+        "EU":       "wss://api-eu.po.market/socket.io/?EIO=4&transport=websocket",
+        "EU_2":     "wss://api-eu2.po.market/socket.io/?EIO=4&transport=websocket",
+        "US_NORTH": "wss://api-us-north.po.market/socket.io/?EIO=4&transport=websocket",
+        "US":       "wss://api-us2.po.market/socket.io/?EIO=4&transport=websocket",
     }
-    
+
     def __init__(self):
         self.REGIONS = {**self.DEMO_SERVERS, **self.REAL_SERVERS}
 
@@ -158,7 +165,7 @@ class REGION:
     def get_regions(self, randomize: bool = True):
         """
         Obtiene la lista de URLs de los servidores.
-        
+
         Args:
             randomize: Si True, devuelve la lista en orden aleatorio
         """
@@ -167,18 +174,19 @@ class REGION:
             return sorted(regions, key=lambda k: random.random())
         return regions
 
-    def get_demo_servers(self, randomize: bool = True):
+    def get_demo_servers(self, randomize: bool = False):
         """
-        Obtiene solo los servidores demo.
+        Obtiene solo los servidores demo en orden determinístico (primario primero).
         """
         servers = list(self.DEMO_SERVERS.values())
         if randomize:
             return sorted(servers, key=lambda k: random.random())
         return servers
 
-    def get_real_servers(self, randomize: bool = True):
+    def get_real_servers(self, randomize: bool = False):
         """
-        Obtiene solo los servidores reales.
+        Obtiene solo los servidores de cuentas reales.
+        El orden base es EU primero, US segundo.
         """
         servers = list(self.REAL_SERVERS.values())
         if randomize:
