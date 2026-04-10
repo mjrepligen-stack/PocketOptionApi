@@ -61,6 +61,8 @@ class PocketOption:
         """
         global_value.SSID = ssid
         self.api = PocketOptionAPI()
+        # Set in :meth:`_run_websocket_thread` for cross-thread close (e.g. backend disconnect).
+        self._io_loop: Optional[asyncio.AbstractEventLoop] = None
 
         self._check_win_queue = Queue()
         self._check_win_thread = threading.Thread(target=self._check_win_worker, daemon=True)
@@ -99,8 +101,36 @@ class PocketOption:
             logger.error(f"Connection error: {e}")
             return False, str(e)
 
+    def disconnect_websocket(self, timeout: float = 12.0) -> bool:
+        """Close the active WebSocket from another thread (shared I/O loop).
+
+        Used when the process must drop the session before opening a new SSID.
+
+        Returns:
+            True if a close was scheduled on a running loop, False otherwise.
+        """
+        loop = getattr(self, "_io_loop", None)
+        if loop is None or not loop.is_running():
+            return False
+
+        async def _close_ws() -> None:
+            try:
+                wc = self.api.websocket
+                if wc.websocket is not None:
+                    await wc.websocket.close()
+            except Exception as exc:
+                logger.debug("disconnect_websocket: %s", exc)
+
+        fut = asyncio.run_coroutine_threadsafe(_close_ws(), loop)
+        try:
+            fut.result(timeout=timeout)
+        except Exception as exc:
+            logger.debug("disconnect_websocket result: %s", exc)
+        return True
+
     def _run_websocket_thread(self):
         loop = asyncio.new_event_loop()
+        self._io_loop = loop
         try:
             asyncio.set_event_loop(loop)
 
