@@ -221,9 +221,10 @@ class WebsocketClient:
                         self._sync_time_from_http_date(ws)
 
                         try:
+                            # Python 3.11+: asyncio.wait() requires Tasks, not bare coroutines.
                             tasks = [
-                                self.websocket_listener(ws),
-                                self.send_ping(ws),
+                                asyncio.create_task(self.websocket_listener(ws)),
+                                asyncio.create_task(self.send_ping(ws)),
                             ]
                             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                             for task in pending:
