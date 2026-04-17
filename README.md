@@ -5,25 +5,54 @@
 
 Unofficial Python client for the PocketOption WebSocket API. **Version 2.0** exposes a synchronous high-level class, `PocketOption`, built on a single WebSocket layer (no separate data-feed module).
 
+## Topics
+
+Suggested GitHub topics for discovery:
+
+`pocketoption` · `trading` · `binary-options` · `websocket` · `socket-io` · `python` · `api-client` · `real-time` · `ohlc` · `financial-data`
+
 ## Features
 
-- **Single WebSocket stack** — `WebsocketClient` handles Socket.IO frames and binary payloads (`451-[type, binary]`); `PocketOptionAPI` holds deques/buffers per asset; `PocketOption` is the stable entry point.
-- **Reliable session handling** — SSID parsing supports PHP-serialized `session` strings with embedded quotes; auth JSON is built with `json.dumps` for correct escaping.
-- **Auth handshake** — Payload includes `platform: 2`, `isFastHistory: true`, `isOptimized: true`. The client treats the connection as ready on **`successauth`** (not on earlier events such as `updateAssets`).
-- **Time synchronization** — Initial offset from the HTTP `Date` header on upgrade, refined with `updateStream` ticks; `TimeSynchronizer` exposes synced UTC and **server-native** time for history requests.
+### Connection and resilience
+
+- **Auto-reconnection** — `WebsocketClient.connect()` walks the candidate server list with exponential backoff (base 1s, cap 10s) and up to **`max_reconnect_attempts` (5)** before raising `ConnectionError`. Failed attempts increment `reconnect_attempts`; auth failures (`41` / `NotAuthorized`) stop the loop immediately.
+- **Backoff on the message loop** — `websocket_listener` is wrapped with **`backoff`** (exponential, max 5 tries / 30s) for transient `WebSocketException` / `ConnectionError` while reading frames.
+- **Keepalive** — Background `42["ps"]` ping every ~20s while connected.
+- **Clean disconnect** — `PocketOption.disconnect_websocket()` closes the socket on the shared asyncio loop (useful before swapping SSID).
+
+### Account mode and endpoints (automatic)
+
+- **Demo vs real from SSID** — On init, `WebsocketClient._parse_ssid()` reads **`isDemo`** and **`uid`** from the wire string and rebuilds auth with `json.dumps` (PHP-style session strings stay valid). If parsing fails, it **defaults to demo** and logs a warning.
+- **Server selection** — **Demo:** EU demo endpoints only, fixed order (`constants.REGION.DEMO_SERVERS`). **Real:** all real endpoints (`REAL_SERVERS`); if there is more than one URL, the client **probes TCP latency in parallel** and tries **fastest-first** (unreachable hosts are still tried last). No manual region configuration is required for real accounts.
+
+### Time and candles
+
+- **Time synchronization** — Initial offset from the HTTP `Date` header on WebSocket upgrade; refined with `updateStream` ticks; `TimeSynchronizer` exposes synced time and **server-native** time for history requests.
 - **Historical candles** — `loadHistoryPeriod` via `GetCandles`, optional **reconciliation** with `updateHistoryNewFast` and stream ticks (strip forming bar, replace stale bars, gap fill when tick coverage allows).
-- **Demo and live** — Parsed from the SSID (`isDemo` / `uid`).
-- **Dependencies** — `websockets>=12` (uses `extra_headers` on v12, `additional_headers` on v13+).
+- **Auth handshake** — Payload includes `platform: 2`, `isFastHistory: true`, `isOptimized: true`. The client treats the session as ready on **`successauth`** (not on earlier events such as `updateAssets`).
+
+### Market data and trading
+
+- **Asset catalog** — After `updateAssets`, each symbol maps to `id`, `name`, `category`, **`payout`** (%), **`is_available`**, **`timeframes`**, and **`raw`** (full server row). Use `get_assets()`, `get_payout(asset)`.
+- **Balance** — `successupdateBalance` updates `global_value.balance` / `balance_updated`; optional `balance_type` mirrors server `isDemo`.
+- **Sentiment** — `chafor` messages fill per-asset values; `get_sentiment(asset)`.
+- **Real-time ticks** — Ring buffer per asset (`subscribe` → `updateStream`); `get_realtime_ticks`.
+- **Orders** — `buy` via `Buyv3` (includes account demo flag from the same `is_demo` as SSID); `check_win` / `get_order_result` for closures.
+
+### Stack and dependencies
+
+- **Single WebSocket stack** — `WebsocketClient` handles Socket.IO frames and binary payloads (`451-[type, binary]`); `PocketOptionAPI` holds deques/buffers per asset; `PocketOption` is the stable entry point.
+- **Dependencies** — `websockets>=12`, `pandas`, `tzlocal`, `backoff` (see `requirements.txt`). The client uses `extra_headers` on websockets v12 and `additional_headers` on v13+.
+
+The old **`datafeed`** module was removed; all streaming logic lives in `ws/client.py`.
 
 ## Architecture (v2.0)
 
 | Layer | Role |
 |--------|------|
-| `pocketoptionapi.ws.client.WebsocketClient` | Connect, auth, message routing, tick/history handlers. |
-| `pocketoptionapi.api.PocketOptionAPI` | Per-asset stream buffers, `updateHistoryNewFast` cache, history/order events. |
-| `pocketoptionapi.stable_api.PocketOption` | Public methods: connect, subscribe, `get_historical_candles`, `buy`, `check_win`, etc. |
-
-The old **`datafeed`** module was removed; all streaming logic lives in `ws/client.py`.
+| `pocketoptionapi.ws.client.WebsocketClient` | Connect, SSID parse, server selection, auth, reconnection, message routing, tick/history handlers. |
+| `pocketoptionapi.api.PocketOptionAPI` | Per-asset stream buffers, `updateHistoryNewFast` cache, asset catalog, history/order events. |
+| `pocketoptionapi.stable_api.PocketOption` | Public methods: `connect`, `subscribe`, `get_historical_candles`, `buy`, `check_win`, etc. |
 
 ## Requirements
 
@@ -93,6 +122,16 @@ The client extracts `session`, `isDemo`, and `uid`, then builds a fresh auth mes
 2. Poll until `check_connect()` and `is_time_synced()` are true. **`get_historical_candles` returns `None` if time is not synced.**
 3. For candle-aligned logic, use `get_server_datetime()` / `get_server_timestamp()` (synced UTC-based estimates).
 
+### Reconnection behavior (implementation summary)
+
+| Mechanism | Where | Behavior |
+|-----------|--------|----------|
+| Connect loop | `WebsocketClient.connect` | Tries each URL in the current list; on failure, backoff sleep and retry until connected, auth error, or **5** failed rounds across the outer loop. |
+| Read loop | `websocket_listener` | `@backoff.on_exception` retries transient read errors before surfacing. |
+| Auth failure | `41` / `NotAuthorized` | Sets `global_value.check_websocket_if_error`; no further server attempts for that session. |
+
+To **close** the socket from your code (e.g. before a new SSID), call `disconnect_websocket()`.
+
 ## Main API (`PocketOption`)
 
 ### Connection
@@ -100,6 +139,7 @@ The client extracts `session`, `isDemo`, and `uid`, then builds a fresh auth mes
 | Method | Description |
 |--------|-------------|
 | `connect()` | Start WebSocket thread; wait up to ~30s for connection. Returns `(success: bool, error: str \| None)`. |
+| `disconnect_websocket(timeout=12.0)` | Schedule `websocket.close()` on the client event loop; returns whether a running loop was found. |
 | `check_connect()` | Whether `global_value.websocket_is_connected` is true. |
 | `is_time_synced()` | Whether `TimeSynchronizer` has references and offset (needed for history). |
 
@@ -119,6 +159,8 @@ The client extracts `session`, `isDemo`, and `uid`, then builds a fresh auth mes
 | `get_payout(asset)` | Payout % or `None`. |
 | `get_sentiment(asset)` | Sentiment from `chafor` cache or `None`. |
 | `get_open_deals()` / `get_closed_deals()` / `get_pending_deals()` | Shallow copies of server-fed lists. |
+
+After successful auth, the server may send an account id; the client stores it in **`global_value.account_id`** when present in the `successauth` payload.
 
 ### Real-time data
 
@@ -158,7 +200,7 @@ After fetch, `_reconcile_with_realtime` may:
 | `check_win(id_number, callback=None)` | Queues resolution against `successcloseOrder` / `_order_results`; optional callback with deal dict. |
 | `get_order_result(id_number)` | Snapshot of cached result if `deals` present. |
 
-There is **no** high-level `close()` on `PocketOption`; the socket runs until the process exits or the thread ends. Lower-level `PocketOptionAPI.websocket` exposes async `close` if you extend the client.
+There is **no** high-level `close()` on `PocketOption`; use `disconnect_websocket()` or end the process. Lower-level `PocketOptionAPI.websocket` exposes async helpers if you extend the client.
 
 ## Error types
 
@@ -192,7 +234,7 @@ Supported bar sizes (seconds) include:
 
 ## Assets
 
-Forex, crypto, indices, commodities, and stock symbols depend on PocketOption’s catalog. Inspect `get_assets()` or `pocketoptionapi.constants` for IDs and names.
+Forex, crypto, indices, commodities, and stock symbols depend on PocketOption’s catalog. Use `get_assets()` for live **`payout`**, **`is_available`**, and **`timeframes`**. Static name/id hints remain in `pocketoptionapi.constants.ACTIVES`.
 
 ## Examples
 
