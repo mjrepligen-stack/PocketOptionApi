@@ -100,7 +100,7 @@ if candles:
     print(len(candles), "bars")
 ```
 
-See `test.py` for a minimal end-to-end script (balance, assets, payout, sentiment, ticks).
+See `test.py` for a minimal end-to-end script (balance, assets, payout, sentiment, ticks). Set **`PO_SSID`** to your captured auth string before running it.
 
 ## SSID format
 
@@ -234,7 +234,7 @@ Forex, crypto, indices, commodities, and stock symbols depend on PocketOption’
 
 | File | Description |
 |------|-------------|
-| `test.py` | Connection, balance, assets, subscribe, sentiment, ticks. |
+| `test.py` | Connection, balance, assets, subscribe, sentiment, ticks (requires `PO_SSID`). |
 | `examples/ml_trading_bot.py` | Fetch candles, train a small classifier, loop (educational only). |
 | `examples/real-time-data+chart.py` | Real-time chart demo. |
 | `examples/buy+check.py` | Order placement pattern. |

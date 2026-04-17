@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import json
 from pocketoptionapi.stable_api import PocketOption
@@ -12,7 +13,14 @@ def process_order_result(result):
 
 
 def main():
-    ssid = r"""42["auth",{"session":"YOUR_SESSION","isDemo":1,"uid":0,"platform":2}]"""
+    ssid = os.environ.get("PO_SSID")
+    if not ssid:
+        logging.error(
+            "Missing PO_SSID. Export your Socket.IO auth string from the browser, e.g. "
+            'export PO_SSID=\'42["auth",{"session":"...","isDemo":1,"uid":...}]\''
+        )
+        return
+
     api = PocketOption(ssid)
     ok, err = api.connect()
 
