@@ -5,12 +5,6 @@
 
 Unofficial Python client for the PocketOption WebSocket API. **Version 2.0** exposes a synchronous high-level class, `PocketOption`, built on a single WebSocket layer (no separate data-feed module).
 
-## Topics
-
-Suggested GitHub topics for discovery:
-
-`pocketoption` · `trading` · `binary-options` · `websocket` · `socket-io` · `python` · `api-client` · `real-time` · `ohlc` · `financial-data`
-
 ## Features
 
 ### Connection and resilience
