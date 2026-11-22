@@ -372,13 +372,14 @@ class WebsocketClient:
                 logger.error(f"Send error: {e}")
                 raise ConnectionError(f"Send error: {e}")
 
+     
     async def send_subfor(self, asset: str) -> None:
         """Sends the subfor subscription message for a given asset."""
         msg = f'42{json.dumps(["subfor", asset])}'
         await self.send_message(msg)
         logger.debug(f"subfor sent for {asset}")
 
-        async def on_message(self, message) -> None:
+    async def on_message(self, message) -> None:
         if isinstance(message, bytes):
             msg_type = self._pending_binary_msg_type
 
@@ -401,69 +402,69 @@ class WebsocketClient:
         logger.debug(f"WebSocket closed: {error}")
         global_value.websocket_is_connected = False
 
-    # ------------------------------------------------------------------
-    # Text message routing (Engine.IO / Socket.IO handshake + events)
-    # ------------------------------------------------------------------
+    # Text message routing
 
     async def _handle_text_message(self, message: str) -> None:
         ws = self.websocket
         if ws is None:
             return
+
         if message.startswith('0{"sid":'):
             logger.debug("Handshake: open packet, sending 40")
             await ws.send("40")
+
         elif message == "2":
             await ws.send("3")
+
         elif message.startswith('40{"sid":'):
             logger.debug("Handshake: namespace connected, sending auth")
             auth_msg = self._build_auth_message()
             logger.info("Sending authentication message")
             await ws.send(auth_msg)
+
         elif message == "41":
             logger.error("Handshake: namespace disconnect (41) — credentials rejected")
             global_value.websocket_is_connected = False
             global_value.check_websocket_if_error = True
-            global_value.websocket_error_reason = "Unauthorized: credentials rejected by server (namespace disconnect 41)"
+            global_value.websocket_error_reason = (
+                "Unauthorized: credentials rejected by server (namespace disconnect 41)"
+            )
             await ws.close()
+
         elif message.startswith("451-["):
             await self._handle_451_message(message)
+
         elif message.startswith("42") and "NotAuthorized" in message:
             await self._handle_unauthorized()
 
-    # ------------------------------------------------------------------
     # 451 binary-event handler
-    # ------------------------------------------------------------------
 
-async def _handle_451_message(self, message: str) -> None:
-    """Records the expected Socket.IO binary event type."""
-    try:
-        json_part = message.split("-", 1)[1]
-        msg_data = json.loads(json_part)
+    async def _handle_451_message(self, message: str) -> None:
+        """Records the expected Socket.IO binary event type."""
+        try:
+            json_part = message.split("-", 1)[1]
+            msg_data = json.loads(json_part)
 
-        if not msg_data or not isinstance(msg_data[0], str):
-            logger.warning("Invalid 451 event header")
-            return
+            if not msg_data or not isinstance(msg_data[0], str):
+                logger.warning("Invalid 451 event header")
+                return
 
-        msg_type = msg_data[0]
+            msg_type = msg_data[0]
 
-        if len(msg_data) < 2 or not isinstance(msg_data[1], dict):
-            logger.warning("Missing binary event placeholder: %s", msg_type)
-            return
+            if len(msg_data) < 2 or not isinstance(msg_data[1], dict):
+                logger.warning("Missing binary event placeholder: %s", msg_type)
+                return
 
-        if not msg_data[1].get("_placeholder"):
-            logger.warning("Invalid binary placeholder: %s", msg_type)
-            return
+            if not msg_data[1].get("_placeholder"):
+                logger.warning("Invalid binary placeholder: %s", msg_type)
+                return
 
-        self._pending_binary_msg_type = msg_type
-        logger.debug("Waiting for binary payload: %s", msg_type)
-
-    except Exception as e:
-        logger.error("Error processing 451 message: %s", e)
+            self._pending_binary_msg_type = msg_type
+            logger.debug("Waiting for binary payload: %s", msg_type)
 
         except Exception as e:
-            logger.error(f"Error processing 451 message: {e}")
-
-    async def _decode_binary_message(self, binary_data: bytes, msg_type: str) -> Any:
+            logger.error("Error processing 451 message: %s", e)
+ async def _decode_binary_message(self, binary_data: bytes, msg_type: str) -> Any:
         """Decodes and dispatches binary message payloads by type."""
         try:
             decoded = binary_data.decode("utf-8")
