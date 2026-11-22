@@ -104,8 +104,7 @@ class PocketOptionAPI(object):
             logger.debug(f"send_websocket_request: name={name}")
         finally:
             global_value.ssl_Mutual_exclusion_write = False
-
-    def send_subfor(self, asset: str):
+                def send_subfor(self, asset: str):
         """Sends subscription using the existing WebSocket event loop."""
         if self._io_loop is None or not self._io_loop.is_running():
             raise RuntimeError("WebSocket event loop is not running")
@@ -115,36 +114,6 @@ class PocketOptionAPI(object):
             self._io_loop
         )
         future.result(timeout=10)
-
-    data = f'42{json.dumps(msg)}'
-
-    while (global_value.ssl_Mutual_exclusion or global_value.ssl_Mutual_exclusion_write) and no_force_send:
-        time.sleep(0.01)
-
-    global_value.ssl_Mutual_exclusion_write = True
-
-    try:
-        if self._io_loop is None or not self._io_loop.is_running():
-            raise RuntimeError("WebSocket event loop is not running")
-
-        future = asyncio.run_coroutine_threadsafe(
-            self.websocket.send_message(data),
-            self._io_loop
-        )
-        future.result(timeout=10)
-
-        logger.debug(f"send_websocket_request: name={name}")
-    finally:
-        global_value.ssl_Mutual_exclusion_write = False
-
-    def send_subfor(self, asset: str):
-    """Sends subscription using the existing WebSocket event loop."""
-    if self._io_loop is None or not self._io_loop.is_running():
-        raise RuntimeError("WebSocket event loop is not running")
-
-    future = asyncio.run_coroutine_threadsafe(
-        self.websocket.send_subfor(asset),
-        self._io_loop
     )
     future.result(timeout=10)
 
