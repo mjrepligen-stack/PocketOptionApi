@@ -105,10 +105,15 @@ class PocketOptionAPI(object):
         global_value.ssl_Mutual_exclusion_write = False
 
     def send_subfor(self, asset: str):
-        """Sends subfor subscription from a sync context (threaded)."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(self.websocket.send_subfor(asset))
+    """Sends subscription using the existing WebSocket event loop."""
+    if self._io_loop is None or not self._io_loop.is_running():
+        raise RuntimeError("WebSocket event loop is not running")
+
+    future = asyncio.run_coroutine_threadsafe(
+        self.websocket.send_subfor(asset),
+        self._io_loop
+    )
+    future.result(timeout=10)
 
     def start_websocket(self):
         global_value.websocket_is_connected = False
