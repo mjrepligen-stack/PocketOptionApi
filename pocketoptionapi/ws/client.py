@@ -378,19 +378,19 @@ class WebsocketClient:
         await self.send_message(msg)
         logger.debug(f"subfor sent for {asset}")
 
-    async def on_message(self, message) -> None:
-    if isinstance(message, bytes):
-        msg_type = self._pending_binary_msg_type
+        async def on_message(self, message) -> None:
+        if isinstance(message, bytes):
+            msg_type = self._pending_binary_msg_type
 
-        if msg_type:
-            self._pending_binary_msg_type = None
-            await self._decode_binary_message(message, msg_type)
+            if msg_type:
+                self._pending_binary_msg_type = None
+                await self._decode_binary_message(message, msg_type)
+                return
+
+            logger.debug("Received binary message without a pending event")
             return
 
-        logger.debug("Received binary message without a pending event")
-        return
-
-    await self._handle_text_message(message)
+        await self._handle_text_message(message)
 
     async def on_error(self, error):
         logger.error(error)
