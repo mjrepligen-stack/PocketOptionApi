@@ -61,6 +61,7 @@ class WebsocketClient:
         self.ssid = global_value.SSID
         self.websocket = None
         self._post_auth_done = False
+        self._pending_binary_msg_type = None
 
     def _parse_ssid(self) -> None:
         """Parses uid, isDemo, and the full session from the raw SSID string.
