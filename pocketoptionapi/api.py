@@ -34,8 +34,11 @@ class PocketOptionAPI(object):
         self.websocket_client = None
         self.websocket_thread = None
         self.session = requests.Session()
-        self.session.verify = False
-        self.session.trust_env = False
+self.session.verify = True
+self.session.trust_env = False
+
+self.time_sync = TimeSynchronizer()
+self.candles = Candles()
         self.proxies = proxies
         self.buy_successful = None
 
