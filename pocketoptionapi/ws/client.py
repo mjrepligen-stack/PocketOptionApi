@@ -379,15 +379,18 @@ class WebsocketClient:
         logger.debug(f"subfor sent for {asset}")
 
     async def on_message(self, message) -> None:
-        if isinstance(message, bytes):
-            try:
-                message = message.decode("utf-8")
-                json.loads(message)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                logger.debug(f"Undecodable binary message ({len(message)} bytes)")
+    if isinstance(message, bytes):
+        msg_type = self._pending_binary_msg_type
+
+        if msg_type:
+            self._pending_binary_msg_type = None
+            await self._decode_binary_message(message, msg_type)
             return
 
-        await self._handle_text_message(message)
+        logger.debug("Received binary message without a pending event")
+        return
+
+    await self._handle_text_message(message)
 
     async def on_error(self, error):
         logger.error(error)
