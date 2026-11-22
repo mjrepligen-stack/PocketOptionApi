@@ -32,6 +32,9 @@ class GetCandles(Base):
         }
 
         data = ["loadHistoryPeriod", data]
-        logger.info(f"GetCandles > {data}")
+        logger.info(
+    f"GetCandles request: asset={active_id}, "
+    f"period={interval}, offset={count}"
+)
 
         self.send_websocket_request(self.name, data)
