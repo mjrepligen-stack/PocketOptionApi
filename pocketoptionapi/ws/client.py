@@ -413,7 +413,7 @@ class WebsocketClient:
         elif message.startswith('40{"sid":'):
             logger.debug("Handshake: namespace connected, sending auth")
             auth_msg = self._build_auth_message()
-            logger.info(f"Sending auth: {auth_msg[:120]}...")
+            logger.info("Sending authentication message")
             await ws.send(auth_msg)
         elif message == "41":
             logger.error("Handshake: namespace disconnect (41) — credentials rejected")
