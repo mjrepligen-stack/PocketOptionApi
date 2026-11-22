@@ -131,6 +131,7 @@ class PocketOption:
     def _run_websocket_thread(self):
         loop = asyncio.new_event_loop()
         self._io_loop = loop
+        self.api._io_loop = loop
         try:
             asyncio.set_event_loop(loop)
 
