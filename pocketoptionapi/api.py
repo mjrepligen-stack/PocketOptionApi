@@ -104,7 +104,7 @@ class PocketOptionAPI(object):
             logger.debug(f"send_websocket_request: name={name}")
         finally:
             global_value.ssl_Mutual_exclusion_write = False
-                def send_subfor(self, asset: str):
+    def send_subfor(self, asset: str):
         """Sends subscription using the existing WebSocket event loop."""
         if self._io_loop is None or not self._io_loop.is_running():
             raise RuntimeError("WebSocket event loop is not running")
@@ -114,8 +114,6 @@ class PocketOptionAPI(object):
             self._io_loop
         )
         future.result(timeout=10)
-    )
-    future.result(timeout=10)
 
     def start_websocket(self):
         global_value.websocket_is_connected = False
