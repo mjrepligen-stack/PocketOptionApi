@@ -459,7 +459,7 @@ class WebsocketClient:
         try:
             decoded = binary_data.decode("utf-8")
             data = json.loads(decoded)
-            logger.debug(f"Binary decoded ({msg_type}): {str(data)[:200]}")
+            logger.debug(f"Binary message decoded successfully: {msg_type}")
 
             if msg_type == "successauth":
                 logger.info("Authentication successful")
