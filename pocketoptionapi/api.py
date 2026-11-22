@@ -27,9 +27,6 @@ STREAM_BUFFER_SIZE = 500
 class PocketOptionAPI(object):
     """Core API class: WebSocket transport, state storage, simple tick buffers."""
 
-    time_sync = TimeSynchronizer()
-    candles = Candles()
-
     # Order tracking
     _order_results: Dict[str, dict] = {}
 
