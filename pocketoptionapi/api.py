@@ -45,6 +45,7 @@ class PocketOptionAPI(object):
         self.buy_successful = None
 
         self.websocket_client = WebsocketClient(self)
+        self._io_loop = None
 
         # Threading events for request-response patterns
         self._history_data_event = threading.Event()
