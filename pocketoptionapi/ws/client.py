@@ -434,26 +434,31 @@ class WebsocketClient:
     # 451 binary-event handler
     # ------------------------------------------------------------------
 
-    async def _handle_451_message(self, message: str) -> None:
-        """Handles Socket.IO binary events: 451-["type", {_placeholder, num}]"""
-        try:
-            json_part = message.split("-", 1)[1]
-            msg_data = json.loads(json_part)
-            msg_type = msg_data[0]
-            logger.debug(f"451 message type: {msg_type}")
+async def _handle_451_message(self, message: str) -> None:
+    """Records the expected Socket.IO binary event type."""
+    try:
+        json_part = message.split("-", 1)[1]
+        msg_data = json.loads(json_part)
 
-            ws = self.websocket
-            if ws is None:
-                return
-            if len(msg_data) > 1 and isinstance(msg_data[1], dict) and msg_data[1].get("_placeholder"):
-                try:
-                    binary_data = await asyncio.wait_for(ws.recv(), timeout=5)
-                    if isinstance(binary_data, bytes):
-                        await self._decode_binary_message(binary_data, msg_type)
-                except asyncio.TimeoutError:
-                    logger.warning(f"Timeout waiting for binary data: {msg_type}")
-                except Exception as e:
-                    logger.error(f"Error receiving binary data for {msg_type}: {e}")
+        if not msg_data or not isinstance(msg_data[0], str):
+            logger.warning("Invalid 451 event header")
+            return
+
+        msg_type = msg_data[0]
+
+        if len(msg_data) < 2 or not isinstance(msg_data[1], dict):
+            logger.warning("Missing binary event placeholder: %s", msg_type)
+            return
+
+        if not msg_data[1].get("_placeholder"):
+            logger.warning("Invalid binary placeholder: %s", msg_type)
+            return
+
+        self._pending_binary_msg_type = msg_type
+        logger.debug("Waiting for binary payload: %s", msg_type)
+
+    except Exception as e:
+        logger.error("Error processing 451 message: %s", e)
 
         except Exception as e:
             logger.error(f"Error processing 451 message: {e}")
